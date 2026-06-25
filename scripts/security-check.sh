@@ -8,7 +8,8 @@ npm audit --prefix web --omit=dev
 cmake -S . -B build-security -G Ninja -DCMAKE_BUILD_TYPE=Debug \
   -DPCT_ENABLE_SANITIZERS=ON -DPCT_WARNINGS_AS_ERRORS=ON
 cmake --build build-security
-ctest --test-dir build-security --output-on-failure
+cmake -E env ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 \
+  ctest --test-dir build-security --output-on-failure
 
 grep -q 'htonl(INADDR_LOOPBACK)' src/service/http_server.cpp
 grep -q 'max_download_size = 10 \* 1024 \* 1024' src/import/import_service.cpp

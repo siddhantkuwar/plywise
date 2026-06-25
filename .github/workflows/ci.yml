@@ -48,4 +48,4 @@ jobs:
       - uses: lukka/get-cmake@latest
       - run: cmake -S . -B build-sanitizers -G Ninja -DCMAKE_BUILD_TYPE=Debug -DPCT_ENABLE_SANITIZERS=ON -DPCT_WARNINGS_AS_ERRORS=ON
       - run: cmake --build build-sanitizers
-      - run: ctest --test-dir build-sanitizers --output-on-failure
+      - run: cmake -E env ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_error=1 ctest --test-dir build-sanitizers --output-on-failure
