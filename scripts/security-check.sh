@@ -12,17 +12,24 @@ cmake -E env ASAN_OPTIONS=detect_leaks=0:abort_on_error=1 UBSAN_OPTIONS=halt_on_
   ctest --test-dir build-security --output-on-failure
 
 grep -q 'htonl(INADDR_LOOPBACK)' src/service/http_server.cpp
-grep -q 'max_download_size = 10 \* 1024 \* 1024' src/import/import_service.cpp
+grep -q 'chesscom_max_body_size = 10U \* 1024U \* 1024U' include/pct/import/chesscom_archive_client.hpp
 grep -q 'max_body_size = 10 \* 1024 \* 1024' src/service/http_server.cpp
 grep -q 'request_path.find("..")' src/service/http_server.cpp
+grep -q 'CURLOPT_PROTOCOLS_STR, "https"' src/import/chesscom_archive_client.cpp
+grep -q 'CURLOPT_FOLLOWLOCATION, 0L' src/import/chesscom_archive_client.cpp
+grep -q 'validate_effective_endpoint' src/import/chesscom_archive_client.cpp
+grep -q 'valid_websocket_origin' src/service/http_server.cpp
 
 if command -v clang-tidy >/dev/null 2>&1; then
   clang-tidy -p build-security \
-    src/engine/pool.cpp src/storage/event_log.cpp src/service/http_server.cpp \
+    src/engine/pool.cpp src/storage/event_log.cpp src/import/chesscom_archive_client.cpp \
+    src/app/ingest_manager.cpp src/service/http_server.cpp \
     --warnings-as-errors='clang-analyzer-*'
 else
   /usr/bin/clang++ --analyze -std=c++20 -Iinclude src/engine/pool.cpp -o /tmp/pct-pool.plist
   /usr/bin/clang++ --analyze -std=c++20 -Iinclude src/storage/event_log.cpp -o /tmp/pct-storage.plist
+  /usr/bin/clang++ --analyze -std=c++20 -Iinclude src/import/chesscom_archive_client.cpp -o /tmp/pct-chesscom.plist
+  /usr/bin/clang++ --analyze -std=c++20 -Iinclude src/app/ingest_manager.cpp -o /tmp/pct-ingest.plist
   /usr/bin/clang++ --analyze -std=c++20 -Iinclude src/service/http_server.cpp -o /tmp/pct-http.plist
   printf '%s\n' "clang-tidy not installed; Clang Static Analyzer fallback passed."
 fi

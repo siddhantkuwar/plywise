@@ -36,6 +36,10 @@ enum class EventType : std::uint16_t {
     AnalysisJobStateChanged = 18,
     DrillSessionUpdated = 19,
     ShallowAnalysisCompleted = 20,
+    ChessComProfileUpdated = 21,
+    ChessComArchiveChunkIndexed = 22,
+    ChessComMonthCheckpointed = 23,
+    ChessComSyncStateChanged = 24,
 };
 
 struct Event {

@@ -6,9 +6,16 @@
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <algorithm>
+#include <cerrno>
+#include <cctype>
+#include <fcntl.h>
+#include <regex>
 #include <set>
 #include <sstream>
+#include <sys/stat.h>
 #include <utility>
+#include <unistd.h>
 
 namespace pct::app {
 namespace {
@@ -291,16 +298,182 @@ json::Value imported_event(const import::ImportedGame& imported) {
 
 void write_index(const std::filesystem::path& path, const json::Value& value) {
     const std::filesystem::path temporary = path.string() + ".tmp";
-    {
-        std::ofstream output(temporary, std::ios::binary | std::ios::trunc);
-        if (!output)
-            throw Error(ErrorCode::IoError, "failed to create derived index " + path.string());
-        output << json::dump(value);
-        output.flush();
-        if (!output)
-            throw Error(ErrorCode::IoError, "failed to write derived index " + path.string());
+    const std::string encoded = json::dump(value);
+    const int descriptor = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (descriptor < 0)
+        throw Error(ErrorCode::IoError, "failed to create derived index " + path.string());
+    try {
+        std::size_t offset = 0;
+        while (offset < encoded.size()) {
+            const ssize_t written =
+                write(descriptor, encoded.data() + offset, encoded.size() - offset);
+            if (written < 0)
+                throw Error(ErrorCode::IoError, "failed to write derived index " + path.string());
+            offset += static_cast<std::size_t>(written);
+        }
+        if (fsync(descriptor) != 0)
+            throw Error(ErrorCode::IoError, "failed to sync derived index " + path.string());
+        close(descriptor);
+    } catch (...) {
+        close(descriptor);
+        std::filesystem::remove(temporary);
+        throw;
     }
     std::filesystem::rename(temporary, path);
+    std::filesystem::permissions(path,
+                                 std::filesystem::perms::owner_read |
+                                     std::filesystem::perms::owner_write,
+                                 std::filesystem::perm_options::replace);
+}
+
+std::string trim_ascii(std::string_view value) {
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string_view::npos)
+        return {};
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return std::string(value.substr(first, last - first + 1));
+}
+
+std::string sanitize_error(std::string_view error) {
+    std::string result;
+    result.reserve(std::min<std::size_t>(error.size(), chesscom_profile_error_limit * 2));
+    bool previous_space = false;
+    for (const char raw_character : error) {
+        const auto character = static_cast<unsigned char>(raw_character);
+        if (result.size() >= chesscom_profile_error_limit * 2)
+            break;
+        const bool space = std::iscntrl(character) || std::isspace(character);
+        if (space) {
+            if (!result.empty() && !previous_space)
+                result.push_back(' ');
+        } else {
+            result.push_back(static_cast<char>(character));
+        }
+        previous_space = space;
+    }
+    while (!result.empty() && result.back() == ' ')
+        result.pop_back();
+    static const std::regex query_secret(R"(([?&][^=&\s?#]+)=[^&\s#]+)");
+    static const std::regex named_secret(
+        R"(((authorization|cookie|set-cookie|token|access[_-]?token|refresh[_-]?token|api[_-]?key|password|secret)\s*[:=]\s*)[^\s,;]+)",
+        std::regex_constants::icase);
+    static const std::regex bearer_secret(R"((bearer\s+)[^\s,;]+)",
+                                          std::regex_constants::icase);
+    result = std::regex_replace(result, bearer_secret, "$1[redacted]");
+    result = std::regex_replace(result, query_secret, "$1=[redacted]");
+    result = std::regex_replace(result, named_secret, "$1[redacted]");
+    if (result.size() > chesscom_profile_error_limit)
+        result.resize(chesscom_profile_error_limit);
+    return result;
+}
+
+std::string validate_cursor(std::string_view cursor) {
+    std::string result = trim_ascii(cursor);
+    if (result.size() > chesscom_profile_cursor_limit)
+        throw Error(ErrorCode::InvalidArgument, "Chess.com archive cursor is too long");
+    for (const char raw_character : result) {
+        const auto character = static_cast<unsigned char>(raw_character);
+        if (character < 0x21U || character > 0x7eU)
+            throw Error(ErrorCode::InvalidArgument, "Chess.com archive cursor is invalid");
+    }
+    return result;
+}
+
+void create_private_directory(const std::filesystem::path& path) {
+    if (::mkdir(path.c_str(), 0700) != 0 && errno != EEXIST)
+        throw Error(ErrorCode::IoError, "failed to create private repository directory");
+}
+
+json::Value chesscom_profile_json(const ChessComProfile& profile) {
+    json::Value::Array controls;
+    for (const auto& control : profile.selected_time_controls)
+        controls.emplace_back(control);
+    return json::Value::Object{
+        {"original_username", profile.original_username},
+        {"normalized_username", profile.normalized_username},
+        {"selected_time_controls", std::move(controls)},
+        {"archive_cursor", profile.archive_cursor},
+        {"last_successful_sync_ms", static_cast<double>(profile.last_successful_sync_ms)},
+        {"last_error", profile.last_error},
+    };
+}
+
+ChessComProfile chesscom_profile_from_json(const json::Value& value) {
+    ChessComProfile profile;
+    profile.original_username = value.at("original_username").as_string();
+    profile.normalized_username = value.at("normalized_username").as_string();
+    for (const auto& item : value.at("selected_time_controls").as_array())
+        profile.selected_time_controls.push_back(item.as_string());
+    profile.original_username = trim_ascii(profile.original_username);
+    if (profile.normalized_username != normalize_chesscom_username(profile.original_username))
+        throw Error(ErrorCode::InvalidArgument, "stored Chess.com username is invalid");
+    profile.archive_cursor = validate_cursor(value.get("archive_cursor", "").as_string());
+    profile.last_successful_sync_ms = static_cast<std::int64_t>(
+        value.get("last_successful_sync_ms", 0).as_number());
+    if (profile.last_successful_sync_ms < 0)
+        throw Error(ErrorCode::InvalidArgument, "stored Chess.com sync time is invalid");
+    profile.last_error = sanitize_error(value.get("last_error", "").as_string());
+    return profile;
+}
+
+json::Value chesscom_archive_json(const ChessComArchiveEntry& entry) {
+    return json::Value::Object{
+        {"game_id", entry.game_id}, {"canonical_url", entry.canonical_url},
+        {"pgn", entry.pgn}, {"username", entry.username}, {"month", entry.month},
+        {"time_class", entry.time_class}, {"end_time_ms", static_cast<double>(entry.end_time_ms)},
+        {"fetched_at_ms", static_cast<double>(entry.fetched_at_ms)},
+        {"source_url", entry.source_url},
+    };
+}
+
+ChessComArchiveEntry chesscom_archive_from_json(const json::Value& value) {
+    return ChessComArchiveEntry{
+        value.at("game_id").as_string(), value.at("canonical_url").as_string(),
+        value.at("pgn").as_string(), value.at("username").as_string(),
+        value.at("month").as_string(), value.at("time_class").as_string(),
+        static_cast<std::int64_t>(value.at("end_time_ms").as_number()),
+        static_cast<std::int64_t>(value.at("fetched_at_ms").as_number()),
+        value.at("source_url").as_string()};
+}
+
+json::Value checkpoint_json(const ChessComMonthCheckpoint& checkpoint) {
+    return json::Value::Object{
+        {"username", checkpoint.username}, {"month", checkpoint.month},
+        {"source_url", checkpoint.source_url}, {"indexed_games", checkpoint.indexed_games},
+        {"completed_at_ms", static_cast<double>(checkpoint.completed_at_ms)},
+    };
+}
+
+ChessComMonthCheckpoint checkpoint_from_json(const json::Value& value) {
+    return ChessComMonthCheckpoint{
+        value.at("username").as_string(), value.at("month").as_string(),
+        value.get("source_url", "").as_string(), value.at("indexed_games").as_size(),
+        static_cast<std::int64_t>(value.at("completed_at_ms").as_number())};
+}
+
+json::Value sync_state_json(const ChessComSyncState& state) {
+    return json::Value::Object{
+        {"status", state.status}, {"username", state.username}, {"cursor", state.cursor},
+        {"current_month", state.current_month}, {"months_completed", state.months_completed},
+        {"games_indexed", state.games_indexed},
+        {"started_at_ms", static_cast<double>(state.started_at_ms)},
+        {"updated_at_ms", static_cast<double>(state.updated_at_ms)},
+        {"last_error", state.last_error},
+    };
+}
+
+ChessComSyncState sync_state_from_json(const json::Value& value) {
+    ChessComSyncState state;
+    state.status = value.get("status", "idle").as_string();
+    state.username = value.get("username", "").as_string();
+    state.cursor = validate_cursor(value.get("cursor", "").as_string());
+    state.current_month = value.get("current_month", "").as_string();
+    state.months_completed = value.get("months_completed", 0).as_size();
+    state.games_indexed = value.get("games_indexed", 0).as_size();
+    state.started_at_ms = static_cast<std::int64_t>(value.get("started_at_ms", 0).as_number());
+    state.updated_at_ms = static_cast<std::int64_t>(value.get("updated_at_ms", 0).as_number());
+    state.last_error = sanitize_error(value.get("last_error", "").as_string());
+    return state;
 }
 
 std::string hash_string(std::uint64_t hash) {
@@ -311,6 +484,46 @@ std::string hash_string(std::uint64_t hash) {
 
 } // namespace
 
+std::string normalize_chesscom_username(std::string_view username) {
+    const auto first = username.find_first_not_of(" \t\r\n");
+    if (first == std::string_view::npos)
+        throw Error(ErrorCode::InvalidArgument, "Chess.com username is empty");
+    const auto last = username.find_last_not_of(" \t\r\n");
+    username = username.substr(first, last - first + 1);
+    if (username.size() > 25)
+        throw Error(ErrorCode::InvalidArgument, "Chess.com username is too long");
+    std::string normalized;
+    normalized.reserve(username.size());
+    for (const char raw_character : username) {
+        const auto character = static_cast<unsigned char>(raw_character);
+        if (!std::isalnum(character) && character != '_' && character != '-')
+            throw Error(ErrorCode::InvalidArgument, "Chess.com username contains invalid characters");
+        normalized.push_back(static_cast<char>(std::tolower(character)));
+    }
+    return normalized;
+}
+
+bool valid_chesscom_month(std::string_view month) {
+    if (month.size() != 7 || month[4] != '-')
+        return false;
+    for (std::size_t index = 0; index < month.size(); ++index)
+        if (index != 4 && !std::isdigit(static_cast<unsigned char>(month[index])))
+            return false;
+    const int year = std::stoi(std::string(month.substr(0, 4)));
+    const int number = std::stoi(std::string(month.substr(5, 2)));
+    return year >= 2000 && year <= 9999 && number >= 1 && number <= 12;
+}
+
+bool valid_chesscom_month_checkpoint(const ChessComMonthCheckpoint& checkpoint) {
+    if (!valid_chesscom_month(checkpoint.month) || checkpoint.completed_at_ms < 0)
+        return false;
+    try {
+        return checkpoint.username == normalize_chesscom_username(checkpoint.username);
+    } catch (const Error&) {
+        return false;
+    }
+}
+
 Repository::Repository(storage::EventLog& log) : log_(log) {
     replay();
     rebuild_indexes();
@@ -319,6 +532,31 @@ Repository::Repository(storage::EventLog& log) : log_(log) {
 void Repository::replay() {
     const storage::ReplayResult events = log_.replay();
     std::uint64_t snapshot_event_id = 0;
+    std::uint64_t selected_snapshot_marker_id = 0;
+    struct SnapshotAuthorization {
+        std::uint64_t watermark{0};
+        std::uint64_t marker_id{0};
+        int version{0};
+    };
+    std::map<std::string, std::vector<SnapshotAuthorization>> snapshot_authorizations;
+    for (const storage::Event& event : events.events) {
+        if (event.type != storage::EventType::ProfileSnapshotCreated)
+            continue;
+        try {
+            const json::Value marker = json::parse(event.payload);
+            const std::string path = marker.at("path").as_string();
+            const auto watermark =
+                static_cast<std::uint64_t>(marker.at("last_event_id").as_number());
+            const int version = marker.at("snapshot_version").as_int();
+            if ((version != 1 && version != 2) || watermark >= event.id || path.empty() ||
+                std::filesystem::path(path).filename() != std::filesystem::path(path))
+                continue;
+            snapshot_authorizations[path].push_back(
+                SnapshotAuthorization{watermark, event.id, version});
+        } catch (const std::exception&) {
+            // A malformed marker cannot authorize a snapshot accelerator.
+        }
+    }
     const std::filesystem::path snapshot_directory = log_.path().parent_path() / "snapshots";
     if (std::filesystem::exists(snapshot_directory)) {
         for (const auto& entry : std::filesystem::directory_iterator(snapshot_directory)) {
@@ -330,7 +568,19 @@ void Repository::replay() {
                 contents << input.rdbuf();
                 const json::Value snapshot = json::parse(contents.str());
                 const auto event_id = static_cast<std::uint64_t>(snapshot.at("last_event_id").as_number());
-                if (snapshot.at("snapshot_version").as_int() != 1 || event_id <= snapshot_event_id)
+                const int snapshot_version = snapshot.at("snapshot_version").as_int();
+                const auto authorizations =
+                    snapshot_authorizations.find(entry.path().filename().string());
+                if ((snapshot_version != 1 && snapshot_version != 2) ||
+                    authorizations == snapshot_authorizations.end())
+                    continue;
+                std::uint64_t marker_id = 0;
+                for (const auto& authorization : authorizations->second)
+                    if (authorization.watermark == event_id &&
+                        authorization.version == snapshot_version)
+                        marker_id = std::max(marker_id, authorization.marker_id);
+                if (marker_id == 0 || event_id < snapshot_event_id ||
+                    (event_id == snapshot_event_id && marker_id <= selected_snapshot_marker_id))
                     continue;
                 std::map<std::string, StoredGame> games;
                 std::map<std::string, training::Drill> drills;
@@ -338,6 +588,10 @@ void Repository::replay() {
                 std::map<std::string, std::string> job_states;
                 std::map<std::string, json::Value> batches;
                 std::set<std::string> recommendations;
+                std::optional<ChessComProfile> chesscom_profile;
+                std::map<std::string, ChessComArchiveEntry> chesscom_archive;
+                std::map<std::string, ChessComMonthCheckpoint> chesscom_checkpoints;
+                ChessComSyncState chesscom_sync_state;
                 const json::Value null_value;
                 for (const auto& value : snapshot.at("games").as_array()) {
                     const std::string pgn = value.at("pgn").as_string();
@@ -381,12 +635,37 @@ void Repository::replay() {
                 for (const auto& value :
                      snapshot.get("recommended_resources", empty_recommendations).as_array())
                     recommendations.insert(value.as_string());
+                if (snapshot_version == 2) {
+                    if (!snapshot.get("chesscom_profile", null_value).is_null())
+                        chesscom_profile =
+                            chesscom_profile_from_json(snapshot.at("chesscom_profile"));
+                    const json::Value empty_archive{json::Value::Array{}};
+                    for (const auto& value :
+                         snapshot.get("chesscom_archive", empty_archive).as_array()) {
+                        auto archive = chesscom_archive_from_json(value);
+                        chesscom_archive.insert_or_assign(archive.game_id, std::move(archive));
+                    }
+                    const json::Value empty_checkpoints{json::Value::Array{}};
+                    for (const auto& value :
+                         snapshot.get("chesscom_checkpoints", empty_checkpoints).as_array()) {
+                        auto checkpoint = checkpoint_from_json(value);
+                        chesscom_checkpoints.insert_or_assign(
+                            checkpoint.username + "\n" + checkpoint.month,
+                            std::move(checkpoint));
+                    }
+                    chesscom_sync_state = sync_state_from_json(
+                        snapshot.get("chesscom_sync_state", json::Value::Object{}));
+                }
                 games_ = std::move(games);
                 drills_ = std::move(drills);
                 resource_completions_ = std::move(completions);
                 analysis_job_states_ = std::move(job_states);
                 batches_ = std::move(batches);
                 recommended_resources_ = std::move(recommendations);
+                chesscom_profile_ = std::move(chesscom_profile);
+                chesscom_archive_ = std::move(chesscom_archive);
+                chesscom_checkpoints_ = std::move(chesscom_checkpoints);
+                chesscom_sync_state_ = std::move(chesscom_sync_state);
                 for (const auto& [_, batch] : batches_)
                     next_batch_id_ = std::max(
                         next_batch_id_,
@@ -396,6 +675,7 @@ void Repository::replay() {
                     for (const auto& attempt : drill.attempts)
                         next_attempt_id_ = std::max(next_attempt_id_, attempt.id + 1);
                 snapshot_event_id = event_id;
+                selected_snapshot_marker_id = marker_id;
             } catch (const std::exception& error) {
                 log(LogLevel::Warning, "repository",
                     "skipping invalid snapshot " + entry.path().filename().string() + ": " +
@@ -474,46 +754,112 @@ void Repository::replay() {
                 batches_.insert_or_assign(id, payload);
                 next_batch_id_ = std::max(next_batch_id_,
                                           static_cast<std::uint64_t>(payload.at("sequence").as_number()) + 1);
+            } else if (event.type == storage::EventType::ChessComProfileUpdated) {
+                chesscom_profile_ = chesscom_profile_from_json(payload);
+            } else if (event.type == storage::EventType::ChessComArchiveChunkIndexed) {
+                for (const auto& value : payload.at("entries").as_array()) {
+                    auto entry = chesscom_archive_from_json(value);
+                    chesscom_archive_.try_emplace(entry.game_id, std::move(entry));
+                }
+            } else if (event.type == storage::EventType::ChessComMonthCheckpointed) {
+                auto checkpoint = checkpoint_from_json(payload);
+                chesscom_checkpoints_.insert_or_assign(
+                    checkpoint.username + "\n" + checkpoint.month, std::move(checkpoint));
+            } else if (event.type == storage::EventType::ChessComSyncStateChanged) {
+                chesscom_sync_state_ = sync_state_from_json(payload);
             }
         } catch (const Error& error) {
             log(LogLevel::Warning, "repository",
                 "skipping event " + std::to_string(event.id) + ": " + error.what());
         }
     }
+    projection_event_id_ = events.events.empty() ? 0 : events.events.back().id;
+    projection_contiguous_ = events.corruptions.empty() && !events.truncated_tail;
+}
+
+void Repository::note_applied_event(const storage::Event& event) {
+    if (projection_contiguous_ && event.id == projection_event_id_ + 1) {
+        projection_event_id_ = event.id;
+        return;
+    }
+    projection_contiguous_ = false;
 }
 
 AddResult Repository::add(const import::ImportedGame& imported) {
     std::lock_guard lock(mutex_);
+    return add_unlocked(imported, true);
+}
+
+BulkAddResult Repository::bulk_add(std::vector<import::ImportedGame> imported_games) {
+    if (imported_games.size() > bulk_game_import_limit)
+        throw Error(ErrorCode::InvalidArgument, "bulk game import has too many games");
+    std::size_t total_pgn_bytes = 0;
+    for (const auto& imported : imported_games) {
+        if (imported.pgn.size() > bulk_game_import_single_pgn_byte_limit ||
+            imported.source_url.size() > bulk_game_import_source_url_limit ||
+            imported.pgn.size() > bulk_game_import_pgn_byte_limit - total_pgn_bytes)
+            throw Error(ErrorCode::InvalidArgument, "bulk game import PGN data is too large");
+        total_pgn_bytes += imported.pgn.size();
+    }
+
+    std::lock_guard lock(mutex_);
+    BulkAddResult result;
+    result.added_game_ids.reserve(imported_games.size());
+    result.duplicate_game_ids.reserve(imported_games.size());
+    try {
+        for (const auto& imported : imported_games) {
+            if (add_unlocked(imported, false) == AddResult::Added) {
+                ++result.added;
+                result.added_game_ids.push_back(imported.game.identity);
+            } else {
+                ++result.duplicates;
+                result.duplicate_game_ids.push_back(imported.game.identity);
+            }
+        }
+    } catch (...) {
+        if (result.added > 0)
+            rebuild_indexes();
+        throw;
+    }
+    if (result.added > 0)
+        rebuild_indexes();
+    return result;
+}
+
+AddResult Repository::add_unlocked(const import::ImportedGame& imported,
+                                   bool rebuild_indexes_after_add) {
     if (games_.contains(imported.game.identity))
         return AddResult::Duplicate;
-    static_cast<void>(
-        log_.append(storage::EventType::GameImported, json::dump(imported_event(imported))));
-    static_cast<void>(
+    const storage::Event imported_event_record =
+        log_.append(storage::EventType::GameImported, json::dump(imported_event(imported)));
+    const storage::Event parsed_event_record =
         log_.append(storage::EventType::GameParsed, json::dump(json::Value::Object{
                                                         {"game_id", imported.game.identity},
                                                         {"plies", imported.game.plies.size()},
-                                                    })));
-    const auto imported_at = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                 std::chrono::system_clock::now().time_since_epoch())
-                                 .count();
+                                                    }));
     games_.emplace(imported.game.identity,
-                   StoredGame{imported, std::nullopt, imported_at, 0, std::nullopt});
+                   StoredGame{imported, std::nullopt, imported_event_record.timestamp_ms, 0,
+                              std::nullopt});
+    note_applied_event(imported_event_record);
+    note_applied_event(parsed_event_record);
     for (const auto& color : {std::string("White"), std::string("Black")}) {
         const std::string rating = imported.game.tag(color + "Elo");
         if (rating.empty())
             continue;
         try {
             const int value = std::stoi(rating);
-            static_cast<void>(log_.append(
+            const storage::Event rating_event = log_.append(
                 storage::EventType::RatingObserved,
                 json::dump(json::Value::Object{{"game_id", imported.game.identity},
                                                 {"player", imported.game.tag(color)},
                                                 {"color", color == "White" ? "white" : "black"},
-                                                {"rating", value}})));
+                                                {"rating", value}}));
+            note_applied_event(rating_event);
         } catch (const std::exception&) {
         }
     }
-    rebuild_indexes();
+    if (rebuild_indexes_after_add)
+        rebuild_indexes();
     return AddResult::Added;
 }
 
@@ -523,7 +869,7 @@ void Repository::save_analysis(const analysis::GameAnalysis& analysis) {
     if (found == games_.end())
         throw Error(ErrorCode::NotFound, "cannot save analysis for unknown game");
     for (const auto& move : analysis.moves) {
-        static_cast<void>(
+        note_applied_event(
             log_.append(storage::EventType::PositionAnalyzed, json::dump(json::Value::Object{
                                                                   {"game_id", analysis.game_id},
                                                                   {"move", move_json(move)},
@@ -533,12 +879,12 @@ void Repository::save_analysis(const analysis::GameAnalysis& analysis) {
         json::Value::Array classification_evidence;
         for (const auto& evidence : mistake.evidence)
             classification_evidence.emplace_back(evidence);
-        static_cast<void>(
+        note_applied_event(
             log_.append(storage::EventType::MistakeDetected, json::dump(json::Value::Object{
                                                                  {"game_id", analysis.game_id},
                                                                  {"mistake", mistake_json(mistake)},
                                                              })));
-        static_cast<void>(
+        note_applied_event(
             log_.append(storage::EventType::MistakeClassified, json::dump(json::Value::Object{
                                                                    {"game_id", analysis.game_id},
                                                                    {"ply", mistake.ply},
@@ -547,21 +893,25 @@ void Repository::save_analysis(const analysis::GameAnalysis& analysis) {
                                                                    {"confidence", mistake.confidence},
                                                                    {"classifier_version", mistake.classifier_version},
                                                                })));
-        static_cast<void>(log_.append(storage::EventType::ExplanationCreated,
-                                      json::dump(json::Value::Object{
-                                          {"game_id", analysis.game_id},
-                                          {"ply", mistake.ply},
-                                          {"explanation", mistake.explanation},
-                                      })));
+        note_applied_event(log_.append(storage::EventType::ExplanationCreated,
+                                       json::dump(json::Value::Object{
+                                           {"game_id", analysis.game_id},
+                                           {"ply", mistake.ply},
+                                           {"explanation", mistake.explanation},
+                                       })));
     }
-    static_cast<void>(
+    const storage::Event completed_event =
         log_.append(storage::EventType::AnalysisCompleted, json::dump(json::Value::Object{
                                                                {"game_id", analysis.game_id},
                                                                {"analysis", to_json(analysis)},
-                                                           })));
+                                                           }));
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
                          std::chrono::system_clock::now().time_since_epoch())
                          .count();
+    found->second.analysis = analysis;
+    found->second.shallow_analysis.reset();
+    found->second.analyzed_at_ms = now;
+    note_applied_event(completed_event);
     for (const auto& mistake : analysis.mistakes) {
         const std::string id = analysis.game_id + ":" + std::to_string(mistake.ply);
         if (drills_.contains(id) || mistake.better_moves.empty())
@@ -633,13 +983,11 @@ void Repository::save_analysis(const analysis::GameAnalysis& analysis) {
         }
         if (drill.changed_threat.empty())
             drill.changed_threat = "The opponent's strongest reply is " + drill.punishment + ".";
-        static_cast<void>(log_.append(
-            storage::EventType::DrillCreated, json::dump(training::to_json(drill, now))));
+        const storage::Event drill_event = log_.append(
+            storage::EventType::DrillCreated, json::dump(training::to_json(drill, now)));
         drills_.emplace(id, std::move(drill));
+        note_applied_event(drill_event);
     }
-    found->second.analysis = analysis;
-    found->second.shallow_analysis.reset();
-    found->second.analyzed_at_ms = now;
     rebuild_indexes();
     const std::size_t analyzed_count = static_cast<std::size_t>(std::count_if(
         games_.begin(), games_.end(), [](const auto& entry) { return entry.second.analysis.has_value(); }));
@@ -656,11 +1004,12 @@ void Repository::save_shallow_analysis(const analysis::GameAnalysis& analysis) {
                     "cannot save shallow analysis for unknown game");
     if (found->second.analysis)
         return;
-    static_cast<void>(log_.append(
+    const storage::Event shallow_event = log_.append(
         storage::EventType::ShallowAnalysisCompleted,
         json::dump(json::Value::Object{{"game_id", analysis.game_id},
-                                       {"analysis", to_json(analysis)}})));
+                                       {"analysis", to_json(analysis)}}));
     found->second.shallow_analysis = analysis;
+    note_applied_event(shallow_event);
     rebuild_indexes();
 }
 
@@ -688,9 +1037,11 @@ bool Repository::add_validated_drill(training::Drill drill) {
                                   std::chrono::system_clock::now().time_since_epoch())
                                   .count();
     }
-    static_cast<void>(log_.append(storage::EventType::DrillCreated,
-                                  json::dump(training::to_json(drill, drill.created_at_ms))));
+    const storage::Event drill_event =
+        log_.append(storage::EventType::DrillCreated,
+                    json::dump(training::to_json(drill, drill.created_at_ms)));
     drills_.emplace(drill.id, std::move(drill));
+    note_applied_event(drill_event);
     rebuild_indexes();
     return true;
 }
@@ -757,7 +1108,7 @@ training::DrillAttempt Repository::record_attempt(std::string_view drill_id, std
                                                 : response_time_ms;
     training::DrillAttempt attempt{next_attempt_id_++, attempted_at_ms, correct, std::move(move),
                                    measured_response, found->second.session_hint_level, retries};
-    static_cast<void>(log_.append(
+    const storage::Event attempt_event = log_.append(
         storage::EventType::DrillAttempted,
         json::dump(json::Value::Object{
             {"drill_id", found->second.id}, {"attempt_id", static_cast<double>(attempt.id)},
@@ -766,16 +1117,18 @@ training::DrillAttempt Repository::record_attempt(std::string_view drill_id, std
             {"response_time_ms", static_cast<double>(attempt.response_time_ms)},
             {"hint_level", attempt.hint_level}, {"retries", attempt.retries},
             {"scheduler_version", std::string(training::scheduler_version)},
-        })));
+        }));
     found->second.attempts.push_back(attempt);
+    note_applied_event(attempt_event);
     if (correct) {
-        found->second.session_hint_level = 0;
-        found->second.session_started_at_ms = 0;
-        static_cast<void>(log_.append(
+        const storage::Event session_event = log_.append(
             storage::EventType::DrillSessionUpdated,
             json::dump(json::Value::Object{{"drill_id", found->second.id},
                                             {"hint_level", 0},
-                                            {"started_at_ms", 0}})));
+                                            {"started_at_ms", 0}}));
+        found->second.session_hint_level = 0;
+        found->second.session_started_at_ms = 0;
+        note_applied_event(session_event);
     }
     rebuild_indexes();
     return attempt;
@@ -788,14 +1141,15 @@ training::Drill Repository::begin_drill_session(std::string_view drill_id,
     if (found == drills_.end())
         throw Error(ErrorCode::NotFound, "drill does not exist");
     if (found->second.session_started_at_ms == 0) {
-        found->second.session_started_at_ms = now_ms;
-        static_cast<void>(log_.append(
+        const storage::Event session_event = log_.append(
             storage::EventType::DrillSessionUpdated,
             json::dump(json::Value::Object{
                 {"drill_id", found->second.id},
                 {"hint_level", found->second.session_hint_level},
                 {"started_at_ms", static_cast<double>(now_ms)},
-            })));
+            }));
+        found->second.session_started_at_ms = now_ms;
+        note_applied_event(session_event);
     }
     return found->second;
 }
@@ -810,15 +1164,16 @@ training::Drill Repository::advance_hint(std::string_view drill_id, std::int64_t
     if (found->second.session_hint_level >= available)
         throw Error(ErrorCode::InvalidArgument,
                     "another failed attempt is required before the next hint");
-    found->second.session_hint_level =
-        std::min(3, found->second.session_hint_level + 1);
-    static_cast<void>(log_.append(
+    const int next_hint_level = std::min(3, found->second.session_hint_level + 1);
+    const storage::Event session_event = log_.append(
         storage::EventType::DrillSessionUpdated,
         json::dump(json::Value::Object{
             {"drill_id", found->second.id},
-            {"hint_level", found->second.session_hint_level},
+            {"hint_level", next_hint_level},
             {"started_at_ms", static_cast<double>(found->second.session_started_at_ms)},
-        })));
+        }));
+    found->second.session_hint_level = next_hint_level;
+    note_applied_event(session_event);
     return found->second;
 }
 
@@ -1061,16 +1416,18 @@ std::vector<training::Recommendation> Repository::recommendations() {
         training::recommend(profile_unlocked(), training::default_catalog(), resource_completions_);
     bool changed = false;
     for (const auto& recommendation : recommendations) {
-        if (!recommended_resources_.insert(recommendation.resource.id).second)
+        if (recommended_resources_.contains(recommendation.resource.id))
             continue;
-        changed = true;
-        static_cast<void>(log_.append(
+        const storage::Event recommendation_event = log_.append(
             storage::EventType::ResourceRecommended,
             json::dump(json::Value::Object{
                 {"resource_id", recommendation.resource.id},
                 {"evidence", recommendation.evidence}, {"priority", recommendation.priority},
                 {"catalog_version", std::string(training::catalog_version)},
-            })));
+            }));
+        recommended_resources_.insert(recommendation.resource.id);
+        note_applied_event(recommendation_event);
+        changed = true;
     }
     if (changed)
         rebuild_indexes();
@@ -1085,14 +1442,15 @@ void Repository::complete_resource(std::string resource_id, std::int64_t complet
     });
     if (!known)
         throw Error(ErrorCode::NotFound, "resource does not exist");
-    static_cast<void>(log_.append(
+    const storage::Event resource_event = log_.append(
         storage::EventType::ResourceCompleted,
         json::dump(json::Value::Object{
             {"resource_id", resource_id},
             {"completed_at_ms", static_cast<double>(completed_at_ms)},
             {"catalog_version", std::string(training::catalog_version)},
-        })));
+        }));
     resource_completions_.insert_or_assign(std::move(resource_id), completed_at_ms);
+    note_applied_event(resource_event);
     rebuild_indexes();
 }
 
@@ -1101,7 +1459,11 @@ std::filesystem::path Repository::create_snapshot() {
     const auto replayed = log_.replay();
     if (!replayed.corruptions.empty() || replayed.truncated_tail)
         throw Error(ErrorCode::IoError, "cannot snapshot an invalid event log");
-    const std::uint64_t last_event_id = replayed.events.empty() ? 0 : replayed.events.back().id;
+    const std::uint64_t authoritative_tail =
+        replayed.events.empty() ? 0 : replayed.events.back().id;
+    if (!projection_contiguous_ || authoritative_tail != projection_event_id_)
+        throw Error(ErrorCode::IoError, "cannot snapshot a stale repository projection");
+    const std::uint64_t last_event_id = projection_event_id_;
     json::Value::Array games;
     for (const auto& [_, game] : games_)
         games.push_back(to_json(game, true));
@@ -1121,11 +1483,22 @@ std::filesystem::path Repository::create_snapshot() {
     json::Value::Array recommendations;
     for (const auto& id : recommended_resources_)
         recommendations.emplace_back(id);
+    json::Value::Array chesscom_archive;
+    for (const auto& [_, entry] : chesscom_archive_)
+        chesscom_archive.push_back(chesscom_archive_json(entry));
+    json::Value::Array chesscom_checkpoints;
+    for (const auto& [_, checkpoint] : chesscom_checkpoints_)
+        chesscom_checkpoints.push_back(checkpoint_json(checkpoint));
     const std::filesystem::path directory = log_.path().parent_path() / "snapshots";
-    std::filesystem::create_directories(directory);
-    const std::filesystem::path path = directory / ("projection-" + std::to_string(last_event_id) + ".json");
+    create_private_directory(directory);
+    const auto nonce = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::steady_clock::now().time_since_epoch())
+                           .count();
+    const std::filesystem::path path =
+        directory / ("projection-" + std::to_string(last_event_id) + "-" +
+                     std::to_string(::getpid()) + "-" + std::to_string(nonce) + ".json");
     write_index(path, json::Value::Object{
-                          {"snapshot_version", 1},
+                          {"snapshot_version", 2},
                           {"profile_version", std::string(training::profile_version)},
                           {"last_event_id", static_cast<double>(last_event_id)},
                           {"games", std::move(games)}, {"drills", std::move(drills)},
@@ -1134,13 +1507,21 @@ std::filesystem::path Repository::create_snapshot() {
                           {"batches", std::move(batches)},
                           {"recommended_resources", std::move(recommendations)},
                           {"background_paused", background_paused_},
+                          {"chesscom_profile", chesscom_profile_
+                                                   ? chesscom_profile_json(*chesscom_profile_)
+                                                   : json::Value{}},
+                          {"chesscom_archive", std::move(chesscom_archive)},
+                          {"chesscom_checkpoints", std::move(chesscom_checkpoints)},
+                          {"chesscom_sync_state", sync_state_json(chesscom_sync_state_)},
                       });
-    static_cast<void>(log_.append(storage::EventType::ProfileSnapshotCreated,
-                                  json::dump(json::Value::Object{
-                                      {"path", path.filename().string()},
-                                      {"last_event_id", static_cast<double>(last_event_id)},
-                                      {"snapshot_version", 1},
-                                  })));
+    const storage::Event snapshot_event =
+        log_.append(storage::EventType::ProfileSnapshotCreated,
+                    json::dump(json::Value::Object{
+                        {"path", path.filename().string()},
+                        {"last_event_id", static_cast<double>(last_event_id)},
+                        {"snapshot_version", 2},
+                    }));
+    note_applied_event(snapshot_event);
     rebuild_indexes();
     return path;
 }
@@ -1148,16 +1529,21 @@ std::filesystem::path Repository::create_snapshot() {
 std::size_t Repository::compact_storage() {
     std::lock_guard lock(mutex_);
     const std::size_t events = log_.compact();
+    const auto replayed = log_.replay();
+    for (const auto& event : replayed.events)
+        if (event.id > projection_event_id_)
+            note_applied_event(event);
     rebuild_indexes();
     return events;
 }
 
 void Repository::record_job_state(std::string game_id, std::string status) {
     std::lock_guard lock(mutex_);
-    static_cast<void>(log_.append(
+    const storage::Event job_event = log_.append(
         storage::EventType::AnalysisJobStateChanged,
-        json::dump(json::Value::Object{{"game_id", game_id}, {"status", status}})));
+        json::dump(json::Value::Object{{"game_id", game_id}, {"status", status}}));
     analysis_job_states_.insert_or_assign(std::move(game_id), std::move(status));
+    note_applied_event(job_event);
 }
 
 std::vector<std::string> Repository::recoverable_analysis_jobs() const {
@@ -1174,10 +1560,11 @@ std::vector<std::string> Repository::recoverable_analysis_jobs() const {
 
 void Repository::set_background_paused(bool paused) {
     std::lock_guard lock(mutex_);
-    static_cast<void>(log_.append(
+    const storage::Event paused_event = log_.append(
         storage::EventType::BatchStateChanged,
-        json::dump(json::Value::Object{{"paused", paused}, {"scope", "analysis_queue"}})));
+        json::dump(json::Value::Object{{"paused", paused}, {"scope", "analysis_queue"}}));
     background_paused_ = paused;
+    note_applied_event(paused_event);
 }
 
 bool Repository::background_paused() const {
@@ -1199,8 +1586,10 @@ json::Value Repository::create_batch(std::vector<std::string> game_ids, std::siz
         {"imported", imported}, {"duplicates", duplicates}, {"failed", failed},
         {"game_ids", std::move(ids)},
     }};
-    static_cast<void>(log_.append(storage::EventType::BatchCreated, json::dump(value)));
+    const storage::Event batch_event =
+        log_.append(storage::EventType::BatchCreated, json::dump(value));
     batches_.insert_or_assign(id, value);
+    note_applied_event(batch_event);
     return value;
 }
 
@@ -1246,12 +1635,230 @@ json::Value Repository::batches() const {
                                {"paused", background_paused_}};
 }
 
+void Repository::save_chesscom_profile(ChessComProfile profile) {
+    std::lock_guard lock(mutex_);
+    profile.original_username = trim_ascii(profile.original_username);
+    profile.normalized_username = normalize_chesscom_username(profile.original_username);
+    profile.archive_cursor = validate_cursor(profile.archive_cursor);
+    if (profile.last_successful_sync_ms < 0)
+        throw Error(ErrorCode::InvalidArgument, "Chess.com profile sync time is invalid");
+    profile.last_error = sanitize_error(profile.last_error);
+    static const std::set<std::string> allowed_controls{"bullet", "blitz", "rapid", "daily"};
+    if (profile.selected_time_controls.size() > 16)
+        throw Error(ErrorCode::InvalidArgument, "too many Chess.com time-control values");
+    std::set<std::string> controls;
+    for (auto control : profile.selected_time_controls) {
+        control = trim_ascii(control);
+        if (control.size() > 16)
+            throw Error(ErrorCode::InvalidArgument, "Chess.com time control is too long");
+        std::transform(control.begin(), control.end(), control.begin(), [](unsigned char value) {
+            return static_cast<char>(std::tolower(value));
+        });
+        if (!control.empty() && !allowed_controls.contains(control))
+            throw Error(ErrorCode::InvalidArgument, "Chess.com time control is invalid");
+        if (!control.empty()) controls.insert(std::move(control));
+    }
+    if (controls.size() > allowed_controls.size())
+        throw Error(ErrorCode::InvalidArgument, "too many Chess.com time controls");
+    profile.selected_time_controls.assign(controls.begin(), controls.end());
+    if (chesscom_profile_ == profile)
+        return;
+    const storage::Event profile_event = log_.append(
+        storage::EventType::ChessComProfileUpdated, json::dump(chesscom_profile_json(profile)));
+    chesscom_profile_ = std::move(profile);
+    note_applied_event(profile_event);
+    rebuild_indexes();
+}
+
+std::optional<ChessComProfile> Repository::chesscom_profile() const {
+    std::lock_guard lock(mutex_);
+    return chesscom_profile_;
+}
+
+std::size_t
+Repository::index_chesscom_archive_chunk(std::vector<ChessComArchiveEntry> entries) {
+    std::lock_guard lock(mutex_);
+    if (entries.size() > chesscom_archive_chunk_limit)
+        throw Error(ErrorCode::InvalidArgument, "Chess.com archive chunk has too many entries");
+    std::map<std::string, ChessComArchiveEntry> unique;
+    for (auto& entry : entries) {
+        if (entry.game_id.empty() || entry.pgn.empty() || !valid_chesscom_month(entry.month) ||
+            entry.game_id.size() > 64 || entry.canonical_url.size() > 2048 ||
+            entry.source_url.size() > 2048 || entry.time_class.size() > 16 ||
+            entry.end_time_ms < 0 || entry.fetched_at_ms < 0)
+            throw Error(ErrorCode::InvalidArgument, "Chess.com archive entry is invalid");
+        entry.username = normalize_chesscom_username(entry.username);
+        if (!entry.canonical_url.starts_with("https://www.chess.com/game/") &&
+            !entry.canonical_url.starts_with("https://chess.com/game/"))
+            throw Error(ErrorCode::InvalidArgument, "Chess.com archive URL is invalid");
+        if (!entry.source_url.starts_with("https://api.chess.com/"))
+            throw Error(ErrorCode::InvalidArgument, "Chess.com archive source URL is invalid");
+        if (!chesscom_archive_.contains(entry.game_id))
+            unique.try_emplace(entry.game_id, std::move(entry));
+    }
+    if (unique.empty())
+        return 0;
+    json::Value::Array encoded;
+    for (const auto& [_, entry] : unique)
+        encoded.push_back(chesscom_archive_json(entry));
+    const std::string payload =
+        json::dump(json::Value::Object{{"entries", std::move(encoded)}});
+    if (payload.size() > chesscom_archive_chunk_encoded_byte_limit)
+        throw Error(ErrorCode::InvalidArgument, "Chess.com archive chunk is too large");
+    const storage::Event archive_event = log_.append(
+        storage::EventType::ChessComArchiveChunkIndexed,
+        payload);
+    for (auto& [game_id, entry] : unique)
+        chesscom_archive_.emplace(std::move(game_id), std::move(entry));
+    note_applied_event(archive_event);
+    rebuild_indexes();
+    return unique.size();
+}
+
+std::optional<ChessComArchiveEntry>
+Repository::chesscom_archive_entry(std::string_view game_id) const {
+    std::lock_guard lock(mutex_);
+    const auto found = chesscom_archive_.find(std::string(game_id));
+    return found == chesscom_archive_.end() ? std::nullopt
+                                           : std::optional<ChessComArchiveEntry>(found->second);
+}
+
+ChessComArchivePage
+Repository::search_chesscom_archive(const ChessComArchiveSearch& search) const {
+    std::lock_guard lock(mutex_);
+    const std::string username =
+        search.username.empty() ? std::string{} : normalize_chesscom_username(search.username);
+    if (!search.month.empty() && !valid_chesscom_month(search.month))
+        throw Error(ErrorCode::InvalidArgument, "Chess.com archive month is invalid");
+    const std::size_t limit = std::min(search.limit, chesscom_archive_search_limit);
+    std::vector<const ChessComArchiveEntry*> matches;
+    for (const auto& [_, entry] : chesscom_archive_) {
+        if ((!username.empty() && entry.username != username) ||
+            (!search.month.empty() && entry.month != search.month) ||
+            (!search.time_class.empty() && entry.time_class != search.time_class) ||
+            (search.ended_after_ms > 0 && entry.end_time_ms < search.ended_after_ms) ||
+            (search.ended_before_ms > 0 && entry.end_time_ms > search.ended_before_ms))
+            continue;
+        matches.push_back(&entry);
+    }
+    std::sort(matches.begin(), matches.end(), [](const auto& left, const auto& right) {
+        if (left->end_time_ms != right->end_time_ms)
+            return left->end_time_ms > right->end_time_ms;
+        return left->game_id < right->game_id;
+    });
+    ChessComArchivePage page;
+    if (search.offset >= matches.size() || limit == 0) {
+        page.next_offset = std::min(search.offset, matches.size());
+        page.has_more = search.offset < matches.size();
+        return page;
+    }
+    std::size_t cursor = search.offset;
+    std::size_t copied_pgn_bytes = 0;
+    page.entries.reserve(std::min(limit, matches.size() - cursor));
+    while (cursor < matches.size() && page.entries.size() < limit) {
+        const ChessComArchiveEntry& source = *matches[cursor];
+        if (search.include_pgn && !page.entries.empty() &&
+            source.pgn.size() > chesscom_archive_chunk_encoded_byte_limit - copied_pgn_bytes)
+            break;
+        page.entries.push_back(source);
+        if (search.include_pgn) {
+            copied_pgn_bytes += source.pgn.size();
+        } else {
+            page.entries.back().pgn.clear();
+        }
+        ++cursor;
+    }
+    page.next_offset = cursor;
+    page.has_more = cursor < matches.size();
+    return page;
+}
+
+void Repository::checkpoint_chesscom_month(ChessComMonthCheckpoint checkpoint) {
+    std::lock_guard lock(mutex_);
+    checkpoint.username = normalize_chesscom_username(checkpoint.username);
+    if (!valid_chesscom_month_checkpoint(checkpoint))
+        throw Error(ErrorCode::InvalidArgument, "Chess.com month checkpoint is invalid");
+    const std::string key = checkpoint.username + "\n" + checkpoint.month;
+    const auto existing = chesscom_checkpoints_.find(key);
+    if (existing != chesscom_checkpoints_.end()) {
+        if (existing->second == checkpoint)
+            return;
+        if (checkpoint.completed_at_ms < existing->second.completed_at_ms)
+            throw Error(ErrorCode::InvalidArgument, "Chess.com month checkpoint is stale");
+    }
+    const storage::Event checkpoint_event =
+        log_.append(storage::EventType::ChessComMonthCheckpointed,
+                    json::dump(checkpoint_json(checkpoint)));
+    chesscom_checkpoints_.insert_or_assign(key, std::move(checkpoint));
+    note_applied_event(checkpoint_event);
+    rebuild_indexes();
+}
+
+std::optional<ChessComMonthCheckpoint>
+Repository::chesscom_month_checkpoint(std::string_view username, std::string_view month) const {
+    std::lock_guard lock(mutex_);
+    if (!valid_chesscom_month(month))
+        throw Error(ErrorCode::InvalidArgument, "Chess.com archive month is invalid");
+    const std::string key = normalize_chesscom_username(username) + "\n" + std::string(month);
+    const auto found = chesscom_checkpoints_.find(key);
+    return found == chesscom_checkpoints_.end()
+               ? std::nullopt
+               : std::optional<ChessComMonthCheckpoint>(found->second);
+}
+
+std::vector<ChessComMonthCheckpoint>
+Repository::chesscom_month_checkpoints(std::string_view username) const {
+    std::lock_guard lock(mutex_);
+    const std::string normalized =
+        username.empty() ? std::string{} : normalize_chesscom_username(username);
+    std::vector<ChessComMonthCheckpoint> result;
+    for (const auto& [_, checkpoint] : chesscom_checkpoints_)
+        if (normalized.empty() || checkpoint.username == normalized)
+            result.push_back(checkpoint);
+    std::sort(result.begin(), result.end(), [](const auto& left, const auto& right) {
+        if (left.username != right.username)
+            return left.username < right.username;
+        return left.month < right.month;
+    });
+    return result;
+}
+
+void Repository::save_chesscom_sync_state(ChessComSyncState state) {
+    std::lock_guard lock(mutex_);
+    static const std::set<std::string> statuses{
+        "idle", "running", "paused", "succeeded", "failed"};
+    if (!statuses.contains(state.status) || state.started_at_ms < 0 || state.updated_at_ms < 0 ||
+        (!state.current_month.empty() && !valid_chesscom_month(state.current_month)))
+        throw Error(ErrorCode::InvalidArgument, "Chess.com sync state is invalid");
+    if (!state.username.empty())
+        state.username = normalize_chesscom_username(state.username);
+    state.cursor = validate_cursor(state.cursor);
+    state.last_error = sanitize_error(state.last_error);
+    if (state.updated_at_ms < chesscom_sync_state_.updated_at_ms)
+        throw Error(ErrorCode::InvalidArgument, "Chess.com sync state is stale");
+    if (state == chesscom_sync_state_)
+        return;
+    const storage::Event sync_event =
+        log_.append(storage::EventType::ChessComSyncStateChanged,
+                    json::dump(sync_state_json(state)));
+    chesscom_sync_state_ = std::move(state);
+    note_applied_event(sync_event);
+    rebuild_indexes();
+}
+
+ChessComSyncState Repository::chesscom_sync_state() const {
+    std::lock_guard lock(mutex_);
+    return chesscom_sync_state_;
+}
+
 void Repository::rebuild_indexes() const {
     json::Value::Array games;
     json::Value::Array positions;
     json::Value::Array mistakes;
     json::Value::Array drills;
     json::Value::Array ratings;
+    json::Value::Array chesscom_archive;
+    json::Value::Array chesscom_checkpoints;
     for (const auto& [id, stored] : games_) {
         games.emplace_back(json::Value::Object{
             {"game_id", id},
@@ -1308,6 +1915,10 @@ void Repository::rebuild_indexes() const {
                                                  {"ply", drill.source_ply},
                                                  {"category", drill.category}});
     }
+    for (const auto& [_, entry] : chesscom_archive_)
+        chesscom_archive.push_back(chesscom_archive_json(entry));
+    for (const auto& [_, checkpoint] : chesscom_checkpoints_)
+        chesscom_checkpoints.push_back(checkpoint_json(checkpoint));
     const std::filesystem::path directory = log_.path().parent_path();
     json::Value::Array resources;
     for (const auto& resource : training::default_catalog()) {
@@ -1365,6 +1976,17 @@ void Repository::rebuild_indexes() const {
                 json::Value::Object{{"version", 1}, {"ratings", std::move(ratings)}});
     write_index(directory / "snapshots.idx",
                 json::Value::Object{{"version", 1}, {"snapshots", std::move(snapshots)}});
+    write_index(directory / "chesscom-profile.idx",
+                json::Value::Object{
+                    {"version", 1},
+                    {"profile", chesscom_profile_ ? chesscom_profile_json(*chesscom_profile_)
+                                                  : json::Value{}},
+                    {"checkpoints", std::move(chesscom_checkpoints)},
+                    {"sync_state", sync_state_json(chesscom_sync_state_)},
+                });
+    write_index(directory / "chesscom-archive.idx",
+                json::Value::Object{{"version", 1},
+                                    {"entries", std::move(chesscom_archive)}});
 }
 
 json::Value to_json(const chess::Game& game) {

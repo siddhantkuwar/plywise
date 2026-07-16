@@ -13,6 +13,7 @@
 #include <fstream>
 #include <limits>
 #include <set>
+#include <sys/stat.h>
 
 namespace pct::storage {
 namespace {
@@ -22,6 +23,39 @@ constexpr std::size_t header_size = 32;
 constexpr std::size_t checksum_size = 4;
 constexpr std::size_t minimum_record_size = header_size + checksum_size;
 constexpr std::size_t maximum_record_size = 16 * 1024 * 1024;
+
+void create_private_directories(const std::filesystem::path& path) {
+    std::vector<std::filesystem::path> missing;
+    for (auto current = path; !current.empty() && !std::filesystem::exists(current);
+         current = current.parent_path()) {
+        missing.push_back(current);
+        if (current == current.parent_path())
+            break;
+    }
+    for (auto iterator = missing.rbegin(); iterator != missing.rend(); ++iterator) {
+        if (::mkdir(iterator->c_str(), 0700) != 0 && errno != EEXIST)
+            throw Error(ErrorCode::IoError,
+                        std::string("failed to create event-log directory: ") +
+                            std::strerror(errno));
+    }
+}
+
+void fsync_parent_directory(const std::filesystem::path& path) {
+    const std::filesystem::path parent =
+        path.has_parent_path() ? path.parent_path() : std::filesystem::path{"."};
+    const int descriptor = open(parent.c_str(), O_RDONLY);
+    if (descriptor < 0)
+        throw Error(ErrorCode::IoError,
+                    std::string("failed to open event-log directory: ") + std::strerror(errno));
+    if (fsync(descriptor) != 0) {
+        const int saved_errno = errno;
+        close(descriptor);
+        throw Error(ErrorCode::IoError,
+                    std::string("failed to sync event-log directory: ") +
+                        std::strerror(saved_errno));
+    }
+    close(descriptor);
+}
 
 template <typename T> void append_little_endian(std::vector<std::byte>& output, T value) {
     using Unsigned = std::make_unsigned_t<T>;
@@ -76,12 +110,18 @@ std::size_t find_magic(const std::vector<std::byte>& data, std::size_t offset) {
 
 EventLog::EventLog(std::filesystem::path path) : path_(std::move(path)) {
     if (path_.has_parent_path())
-        std::filesystem::create_directories(path_.parent_path());
-    if (!std::filesystem::exists(path_)) {
-        std::ofstream create(path_, std::ios::binary);
-        if (!create)
-            throw Error(ErrorCode::IoError, "failed to create event log");
+        create_private_directories(path_.parent_path());
+    const int descriptor = open(path_.c_str(), O_WRONLY | O_CREAT, 0600);
+    if (descriptor < 0)
+        throw Error(ErrorCode::IoError,
+                    std::string("failed to create event log: ") + std::strerror(errno));
+    if (fchmod(descriptor, 0600) != 0) {
+        const int saved_errno = errno;
+        close(descriptor);
+        throw Error(ErrorCode::IoError,
+                    std::string("failed to secure event log: ") + std::strerror(saved_errno));
     }
+    close(descriptor);
     const ReplayResult state = replay_unlocked();
     for (const Event& event : state.events)
         next_id_ = std::max(next_id_, event.id + 1);
@@ -268,9 +308,12 @@ std::size_t EventLog::compact(const std::function<void(CompactionStage)>& stage_
     std::set<std::string> drill_sessions;
     std::set<std::string> completed_analyses;
     std::set<std::string> shallow_analyses;
+    std::set<std::string> chesscom_months;
     bool kept_snapshot = false;
     bool kept_queue_state = false;
     bool kept_migration = false;
+    bool kept_chesscom_profile = false;
+    bool kept_chesscom_sync_state = false;
     for (auto iterator = state.events.rbegin(); iterator != state.events.rend(); ++iterator) {
         bool keep = true;
         try {
@@ -303,6 +346,17 @@ std::size_t EventLog::compact(const std::function<void(CompactionStage)>& stage_
             } else if (iterator->type == EventType::SchemaMigrated) {
                 keep = !kept_migration;
                 kept_migration = true;
+            } else if (iterator->type == EventType::ChessComProfileUpdated) {
+                keep = !kept_chesscom_profile;
+                kept_chesscom_profile = true;
+            } else if (iterator->type == EventType::ChessComSyncStateChanged) {
+                keep = !kept_chesscom_sync_state;
+                kept_chesscom_sync_state = true;
+            } else if (iterator->type == EventType::ChessComMonthCheckpointed) {
+                const auto payload = json::parse(iterator->payload);
+                const std::string key = payload.at("username").as_string() + "\n" +
+                                        payload.at("month").as_string();
+                keep = chesscom_months.insert(key).second;
             } else if (iterator->type == EventType::LogCompacted) {
                 keep = false;
             }
@@ -335,6 +389,11 @@ std::size_t EventLog::compact(const std::function<void(CompactionStage)>& stage_
     const int descriptor = open(temporary.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (descriptor < 0)
         throw Error(ErrorCode::IoError, "failed to create compacted event log");
+    if (fchmod(descriptor, 0600) != 0) {
+        close(descriptor);
+        std::filesystem::remove(temporary);
+        throw Error(ErrorCode::IoError, "failed to secure compacted event log");
+    }
     try {
         for (Event event : state.events) {
             event.schema_version = current_schema_version;
@@ -369,6 +428,7 @@ std::size_t EventLog::compact(const std::function<void(CompactionStage)>& stage_
     if (stage_hook)
         stage_hook(CompactionStage::BeforeReplace);
     std::filesystem::rename(temporary, path_);
+    fsync_parent_directory(path_);
     next_id_ = next_new_id + 1;
     if (stage_hook)
         stage_hook(CompactionStage::Replaced);
@@ -404,6 +464,10 @@ std::string_view name(EventType type) {
     case EventType::AnalysisJobStateChanged: return "AnalysisJobStateChanged";
     case EventType::DrillSessionUpdated: return "DrillSessionUpdated";
     case EventType::ShallowAnalysisCompleted: return "ShallowAnalysisCompleted";
+    case EventType::ChessComProfileUpdated: return "ChessComProfileUpdated";
+    case EventType::ChessComArchiveChunkIndexed: return "ChessComArchiveChunkIndexed";
+    case EventType::ChessComMonthCheckpointed: return "ChessComMonthCheckpointed";
+    case EventType::ChessComSyncStateChanged: return "ChessComSyncStateChanged";
     }
     return "Unknown";
 }

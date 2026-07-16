@@ -1,6 +1,7 @@
 #pragma once
 
 #include "pct/app/job_manager.hpp"
+#include "pct/app/ingest_manager.hpp"
 #include "pct/app/repository.hpp"
 #include "pct/import/import_service.hpp"
 
@@ -11,6 +12,7 @@
 #include <map>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace pct::service {
@@ -34,9 +36,11 @@ class Api {
     using AdvancedDrills = std::function<std::vector<training::Drill>()>;
 
     Api(import::ImportService& importer, app::Repository& repository, app::JobManager& jobs,
-        Diagnostics diagnostics = {}, AdvancedDrills advanced_drills = {})
+        Diagnostics diagnostics = {}, AdvancedDrills advanced_drills = {},
+        app::IngestManager* ingest = nullptr)
         : importer_(importer), repository_(repository), jobs_(jobs),
-          diagnostics_(std::move(diagnostics)), advanced_drills_(std::move(advanced_drills)) {}
+          diagnostics_(std::move(diagnostics)), advanced_drills_(std::move(advanced_drills)),
+          ingest_(ingest) {}
 
     [[nodiscard]] Response handle(const Request& request);
 
@@ -46,6 +50,7 @@ class Api {
     app::JobManager& jobs_;
     Diagnostics diagnostics_;
     AdvancedDrills advanced_drills_;
+    app::IngestManager* ingest_{nullptr};
 };
 
 struct ServerOptions {
@@ -55,7 +60,8 @@ struct ServerOptions {
 
 class HttpServer {
   public:
-    HttpServer(Api& api, app::JobManager& jobs, ServerOptions options = {});
+    HttpServer(Api& api, app::JobManager& jobs, ServerOptions options = {},
+               app::IngestManager* ingest = nullptr);
     ~HttpServer();
 
     HttpServer(const HttpServer&) = delete;
@@ -64,15 +70,23 @@ class HttpServer {
     void run();
     void stop() noexcept;
     void broadcast(std::string_view message);
+    [[nodiscard]] std::uint16_t bound_port() const noexcept {
+        return bound_port_.load(std::memory_order_acquire);
+    }
+    [[nodiscard]] static bool valid_websocket_origin(std::string_view origin);
 
   private:
     Api& api_;
     app::JobManager& jobs_;
+    app::IngestManager* ingest_{nullptr};
     ServerOptions options_;
     std::atomic<bool> stopped_{false};
-    int listen_fd_{-1};
+    std::atomic<std::uint16_t> bound_port_{0};
+    std::atomic<int> listen_fd_{-1};
     std::mutex clients_mutex_;
     std::vector<int> websocket_clients_;
+    std::mutex client_threads_mutex_;
+    std::vector<std::thread> client_threads_;
 
     void handle_client(int client_fd);
     void handle_websocket(int client_fd, const Request& request);

@@ -4,7 +4,9 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <filesystem>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <unistd.h>
@@ -36,7 +38,10 @@ class StagedEngine final : public engine::AnalysisEngine {
         {
             std::lock_guard lock(mutex_);
             depths_.push_back(request.depth);
+            if (request.depth >= 3)
+                deep_started_ = true;
         }
+        condition_.notify_all();
         while (request.depth >= 3 && !allow_deep.load() && !stop_token.stop_requested())
             std::this_thread::sleep_for(std::chrono::milliseconds(2));
         chess::Board board = chess::Board::from_fen(request.fen);
@@ -50,9 +55,78 @@ class StagedEngine final : public engine::AnalysisEngine {
         return depths_;
     }
 
+    [[nodiscard]] bool wait_for_deep() {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2),
+                                   [&] { return deep_started_; });
+    }
+
   private:
     mutable std::mutex mutex_;
+    std::condition_variable condition_;
     std::vector<int> depths_;
+    bool deep_started_{false};
+};
+
+class PreemptibleEngine final : public engine::AnalysisEngine {
+  public:
+    engine::AnalysisResult analyze(const engine::AnalysisRequest& request,
+                                   CancellationToken stop_token) override {
+        if (request.priority == engine::AnalysisPriority::Historical) {
+            {
+                std::lock_guard lock(mutex_);
+                historical_started_ = true;
+            }
+            condition_.notify_all();
+            while (true) {
+                {
+                    std::lock_guard lock(mutex_);
+                    if (allow_historical_)
+                        break;
+                }
+                if (stop_token.stop_requested()) {
+                    {
+                        std::lock_guard lock(mutex_);
+                        historical_preempted_ = true;
+                    }
+                    condition_.notify_all();
+                    throw Error(ErrorCode::Timeout, "historical analysis preempted");
+                }
+                std::this_thread::yield();
+            }
+        }
+        chess::Board board = chess::Board::from_fen(request.fen);
+        const auto moves = board.legal_moves();
+        const std::string best = moves.empty() ? "(none)" : chess::uci(moves.front());
+        return {{{1, request.depth, 0, std::nullopt, 1, 1, {best}}}, best, {}};
+    }
+
+    [[nodiscard]] bool wait_for_historical_start() {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2),
+                                   [&] { return historical_started_; });
+    }
+
+    [[nodiscard]] bool wait_for_preemption() {
+        std::unique_lock lock(mutex_);
+        return condition_.wait_for(lock, std::chrono::seconds(2),
+                                   [&] { return historical_preempted_; });
+    }
+
+    void release_historical() {
+        {
+            std::lock_guard lock(mutex_);
+            allow_historical_ = true;
+        }
+        condition_.notify_all();
+    }
+
+  private:
+    std::mutex mutex_;
+    std::condition_variable condition_;
+    bool historical_started_{false};
+    bool historical_preempted_{false};
+    bool allow_historical_{false};
 };
 
 } // namespace
@@ -189,6 +263,7 @@ TEST_CASE("batch scheduling persists every shallow projection before deep work")
     CHECK(!repository.get(second.game.identity)->analysis.has_value());
     CHECK_EQ(repository.profile().games_shallow_analyzed, 2ULL);
     CHECK(cache.hit_count() > 0);
+    CHECK(engine.wait_for_deep());
     const auto depths_before_release = engine.depths();
     const auto first_deep = std::find_if(depths_before_release.begin(), depths_before_release.end(),
                                          [](int depth) { return depth >= 3; });
@@ -202,6 +277,200 @@ TEST_CASE("batch scheduling persists every shallow projection before deep work")
             break;
         std::this_thread::sleep_for(std::chrono::milliseconds(5));
     }
+    CHECK(repository.get(first.game.identity)->analysis.has_value());
+    CHECK(repository.get(second.game.identity)->analysis.has_value());
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("interactive work is selected before queued historical work") {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("pct-jobs-interactive-priority-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(directory);
+    storage::EventLog log(directory / "events.log");
+    app::Repository repository(log);
+    import::ImportService importer;
+    const auto historical = importer.from_pgn(
+        "[White \"Archive\"]\n[Black \"Past\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0");
+    const auto interactive = importer.from_pgn(
+        "[White \"Player\"]\n[Black \"Open\"]\n[Result \"0-1\"]\n\n1. d4 d5 0-1");
+    static_cast<void>(repository.add(historical));
+    static_cast<void>(repository.add(interactive));
+    repository.set_background_paused(true);
+    QuietEngine engine;
+    analysis::AnalysisCache cache;
+    analysis::Analyzer analyzer(engine, cache, analysis::AnalyzerOptions{2, 3, 80, 2, 1});
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    std::vector<std::string> running;
+    std::vector<std::string> completed;
+    app::JobManager jobs(repository, analyzer, app::JobManagerOptions{1, 8, 0});
+    static_cast<void>(jobs.start_batch({historical.game.identity}));
+    const auto opened = jobs.start(interactive.game.identity);
+    jobs.set_observer([&](const app::AnalysisJob& job) {
+        if (job.status != app::JobStatus::Running &&
+            job.status != app::JobStatus::Complete)
+            return;
+        {
+            std::lock_guard lock(observer_mutex);
+            (job.status == app::JobStatus::Running ? running : completed)
+                .push_back(job.game_id);
+        }
+        observer_condition.notify_all();
+    });
+    jobs.resume();
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_condition.wait_for(lock, std::chrono::seconds(2),
+                                          [&] { return !running.empty(); }));
+        CHECK_EQ(running.front(), opened.game_id);
+    }
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_condition.wait_for(lock, std::chrono::seconds(2),
+                                          [&] { return completed.size() == 2; }));
+    }
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("one worker preempts historical work to admit an interactive game") {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("pct-jobs-interactive-admission-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(directory);
+    storage::EventLog log(directory / "events.log");
+    app::Repository repository(log);
+    import::ImportService importer;
+    const auto historical = importer.from_pgn(
+        "[White \"Archive\"]\n[Black \"Past\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0");
+    const auto interactive = importer.from_pgn(
+        "[White \"Player\"]\n[Black \"Open\"]\n[Result \"0-1\"]\n\n1. d4 d5 0-1");
+    static_cast<void>(repository.add(historical));
+    static_cast<void>(repository.add(interactive));
+    PreemptibleEngine engine;
+    analysis::AnalysisCache cache;
+    analysis::Analyzer analyzer(engine, cache, analysis::AnalyzerOptions{2, 3, 80, 2, 1});
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    bool interactive_complete = false;
+    bool historical_complete = false;
+    app::JobManager jobs(repository, analyzer, app::JobManagerOptions{1, 1, 0});
+    const auto archived = jobs.start_batch({historical.game.identity}).front();
+    CHECK(engine.wait_for_historical_start());
+    CHECK_EQ(jobs.queued_count(), 0ULL);
+    jobs.set_observer([&](const app::AnalysisJob& job) {
+        if (job.game_id == interactive.game.identity &&
+            job.status == app::JobStatus::Complete) {
+            {
+                std::lock_guard lock(observer_mutex);
+                interactive_complete = true;
+            }
+            observer_condition.notify_all();
+        } else if (job.game_id == historical.game.identity &&
+                   job.status == app::JobStatus::Complete) {
+            {
+                std::lock_guard lock(observer_mutex);
+                historical_complete = true;
+            }
+            observer_condition.notify_all();
+        }
+    });
+    const auto opened = jobs.start(interactive.game.identity);
+    CHECK_EQ(opened.game_id, interactive.game.identity);
+    CHECK(engine.wait_for_preemption());
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_condition.wait_for(lock, std::chrono::seconds(2),
+                                          [&] { return interactive_complete; }));
+    }
+    CHECK(repository.get(interactive.game.identity)->analysis.has_value());
+    CHECK(!repository.get(historical.game.identity)->analysis.has_value());
+    engine.release_historical();
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_condition.wait_for(lock, std::chrono::seconds(2),
+                                          [&] { return historical_complete; }));
+    }
+    CHECK(repository.get(historical.game.identity)->analysis.has_value());
+    CHECK(jobs.get(archived.id)->status == app::JobStatus::Complete);
+    std::filesystem::remove_all(directory);
+}
+
+TEST_CASE("observer unsubscribe waits for callbacks and callback failures do not stop workers") {
+    const auto directory = std::filesystem::temp_directory_path() /
+                           ("pct-jobs-observer-lifecycle-" + std::to_string(::getpid()));
+    std::filesystem::remove_all(directory);
+    storage::EventLog log(directory / "events.log");
+    app::Repository repository(log);
+    import::ImportService importer;
+    const auto first = importer.from_pgn(
+        "[White \"Observer\"]\n[Black \"First\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0");
+    const auto second = importer.from_pgn(
+        "[White \"Observer\"]\n[Black \"Second\"]\n[Result \"0-1\"]\n\n1. d4 d5 0-1");
+    static_cast<void>(repository.add(first));
+    static_cast<void>(repository.add(second));
+    repository.set_background_paused(true);
+    QuietEngine engine;
+    analysis::AnalysisCache cache;
+    analysis::Analyzer analyzer(engine, cache, analysis::AnalyzerOptions{2, 3, 80, 2, 1});
+    std::mutex observer_mutex;
+    std::condition_variable observer_condition;
+    bool callback_entered = false;
+    bool release_callback = false;
+    bool callback_finished = false;
+    bool second_complete = false;
+    app::JobManager jobs(repository, analyzer, app::JobManagerOptions{1, 8, 0});
+    jobs.set_observer([&](const app::AnalysisJob& job) {
+        if (job.game_id != first.game.identity || job.status != app::JobStatus::Running)
+            return;
+        std::unique_lock lock(observer_mutex);
+        callback_entered = true;
+        observer_condition.notify_all();
+        observer_condition.wait(lock, [&] { return release_callback; });
+        callback_finished = true;
+        lock.unlock();
+        throw std::runtime_error("observer failure");
+    });
+    static_cast<void>(jobs.start(first.game.identity));
+    jobs.resume();
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_condition.wait_for(lock, std::chrono::seconds(2),
+                                          [&] { return callback_entered; }));
+    }
+    std::promise<void> unsubscribe_started;
+    auto started = unsubscribe_started.get_future();
+    auto unsubscribe = std::async(std::launch::async, [&] {
+        unsubscribe_started.set_value();
+        jobs.set_observer({});
+        std::lock_guard lock(observer_mutex);
+        return callback_finished;
+    });
+    started.wait();
+    CHECK(unsubscribe.wait_for(std::chrono::milliseconds(50)) ==
+          std::future_status::timeout);
+    {
+        std::lock_guard lock(observer_mutex);
+        release_callback = true;
+    }
+    observer_condition.notify_all();
+    CHECK(unsubscribe.wait_for(std::chrono::seconds(2)) == std::future_status::ready);
+    CHECK(unsubscribe.get());
+
+    jobs.set_observer([&](const app::AnalysisJob& job) {
+        if (job.game_id != second.game.identity || job.status != app::JobStatus::Complete)
+            return;
+        {
+            std::lock_guard lock(observer_mutex);
+            second_complete = true;
+        }
+        observer_condition.notify_all();
+    });
+    static_cast<void>(jobs.start(second.game.identity));
+    {
+        std::unique_lock lock(observer_mutex);
+        CHECK(observer_condition.wait_for(lock, std::chrono::seconds(2),
+                                          [&] { return second_complete; }));
+    }
+    jobs.set_observer({});
     CHECK(repository.get(first.game.identity)->analysis.has_value());
     CHECK(repository.get(second.game.identity)->analysis.has_value());
     std::filesystem::remove_all(directory);

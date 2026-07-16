@@ -1,4 +1,5 @@
 #include "pct/analysis/analyzer.hpp"
+#include "pct/app/ingest_manager.hpp"
 #include "pct/app/job_manager.hpp"
 #include "pct/app/repository.hpp"
 #include "pct/common/log.hpp"
@@ -10,6 +11,7 @@
 
 #include <filesystem>
 #include <algorithm>
+#include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
@@ -28,6 +30,7 @@ struct Options {
     std::size_t retry_limit{1};
     std::filesystem::path tactical_corpus{"resources/tactical-corpus.json"};
     bool tactical_corpus_enabled{true};
+    std::string chesscom_username;
 };
 
 Options parse_options(int argc, char** argv) {
@@ -66,15 +69,22 @@ Options parse_options(int argc, char** argv) {
             options.tactical_corpus = value();
         } else if (argument == "--no-tactical-corpus") {
             options.tactical_corpus_enabled = false;
+        } else if (argument == "--chesscom-username") {
+            options.chesscom_username = value();
         } else if (argument == "--help") {
             std::cout << "usage: personal-chess-tutor [--data-dir path] [--web-root path] "
                          "[--stockfish path] [--port number] [--workers 1-16] "
                          "[--max-pending count] [--retry-limit count] "
+                         "[--chesscom-username public-name] "
                          "[--tactical-corpus path | --no-tactical-corpus]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown option: " + std::string(argument));
         }
+    }
+    if (options.chesscom_username.empty()) {
+        if (const char* username = std::getenv("PCT_CHESSCOM_USERNAME"))
+            options.chesscom_username = username;
     }
     return options;
 }
@@ -106,6 +116,8 @@ int main(int argc, char** argv) {
             repository, analyzer,
             pct::app::JobManagerOptions{options.workers, options.max_pending,
                                         options.retry_limit});
+        pct::app::IngestManager ingest(importer, repository, jobs, {}, {}, {},
+                                       options.chesscom_username);
         std::unique_ptr<pct::training::AdvancedDrillGenerator> advanced_drills;
         if (options.tactical_corpus_enabled && std::filesystem::exists(options.tactical_corpus)) {
             advanced_drills = std::make_unique<pct::training::AdvancedDrillGenerator>(
@@ -137,9 +149,9 @@ int main(int argc, char** argv) {
             if (!advanced_drills)
                 return std::vector<pct::training::Drill>{};
             return advanced_drills->generate(repository.profile(), repository.drills(0), 5);
-        });
+        }, &ingest);
         pct::service::HttpServer server(
-            api, jobs, pct::service::ServerOptions{options.port, options.web_root});
+            api, jobs, pct::service::ServerOptions{options.port, options.web_root}, &ingest);
         if (!std::filesystem::exists(options.web_root / "index.html")) {
             pct::log(pct::LogLevel::Warning, "http",
                      "frontend build is missing; run npm run build --prefix web");

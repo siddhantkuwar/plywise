@@ -26,12 +26,14 @@ add_library(pct_core
     src/common/json.cpp
     src/app/repository.cpp
     src/app/job_manager.cpp
+    src/app/ingest_manager.cpp
     src/chess/board.cpp
     src/chess/bitboard.cpp
     src/chess/fen.cpp
     src/chess/san.cpp
     src/chess/pgn.cpp
     src/import/import_service.cpp
+    src/import/chesscom_archive_client.cpp
     src/engine/stockfish.cpp
     src/engine/pool.cpp
     src/analysis/analyzer.cpp
@@ -103,6 +105,10 @@ if(BUILD_TESTING)
         tests/repository_tests.cpp
         tests/job_tests.cpp
         tests/api_tests.cpp
+        tests/chesscom_archive_tests.cpp
+        tests/chesscom_repository_tests.cpp
+        tests/chesscom_api_tests.cpp
+        tests/ingest_manager_tests.cpp
         tests/training_tests.cpp
         tests/corpus_tests.cpp
         tests/phase2_e2e_tests.cpp
@@ -118,5 +124,21 @@ if(BUILD_TESTING)
         PCT_CRASH_STOCKFISH_PATH="$<TARGET_FILE:pct-crash-stockfish>"
         PCT_SLOW_STOCKFISH_PATH="$<TARGET_FILE:pct-slow-stockfish>"
         PCT_TACTICAL_CORPUS_PATH="${CMAKE_CURRENT_BINARY_DIR}/resources/tactical-corpus.json")
+    add_executable(pct-ingest-tests
+        tests/test_main.cpp
+        tests/chesscom_archive_tests.cpp
+        tests/chesscom_repository_tests.cpp
+        tests/chesscom_api_tests.cpp
+        tests/ingest_manager_tests.cpp
+    )
+    target_link_libraries(pct-ingest-tests PRIVATE pct_core)
+    add_executable(pct-integration-tests
+        tests/test_main.cpp
+        tests/chesscom_api_tests.cpp
+        tests/ingest_manager_tests.cpp
+    )
+    target_link_libraries(pct-integration-tests PRIVATE pct_core)
     add_test(NAME pct-tests COMMAND pct-tests)
+    add_test(NAME pct-ingest-tests COMMAND pct-ingest-tests)
+    add_test(NAME pct-integration-tests COMMAND pct-integration-tests)
 endif()

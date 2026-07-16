@@ -72,17 +72,26 @@ class JobManager {
     JobManagerOptions options_;
     mutable std::mutex mutex_;
     std::condition_variable_any condition_;
+    std::condition_variable observer_condition_;
     std::map<std::uint64_t, AnalysisJob> jobs_;
     struct Task {
         std::uint64_t job_id{0};
         bool deep{false};
         engine::AnalysisPriority priority{engine::AnalysisPriority::CurrentGame};
         std::size_t attempts{0};
+        CancellationSource cancellation;
+    };
+    struct ActiveTask {
+        engine::AnalysisPriority priority{engine::AnalysisPriority::CurrentGame};
+        CancellationSource cancellation;
     };
     std::array<std::deque<Task>, 3> queues_;
     std::array<std::size_t, 3> active_by_priority_{};
+    std::map<std::uint64_t, ActiveTask> active_tasks_;
+    std::map<std::uint64_t, engine::AnalysisPriority> requested_priorities_;
     std::uint64_t next_id_{1};
     JobObserver observer_;
+    std::size_t observer_calls_{0};
     std::vector<std::thread> workers_;
     CancellationSource worker_cancellation_;
     bool paused_{false};
@@ -93,8 +102,10 @@ class JobManager {
     [[nodiscard]] std::size_t queued_count_unlocked() const;
     [[nodiscard]] bool runnable_unlocked() const;
     void enqueue_unlocked(Task task);
+    void promote_unlocked(std::uint64_t job_id, engine::AnalysisPriority priority);
+    void preempt_historical_unlocked();
     [[nodiscard]] Task take_unlocked();
-    void finish_task(engine::AnalysisPriority priority);
+    void finish_task(std::uint64_t job_id, engine::AnalysisPriority priority);
     void work(CancellationToken stop_token);
     void notify(const AnalysisJob& job);
 };

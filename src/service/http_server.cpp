@@ -21,6 +21,7 @@
 #include <iomanip>
 #include <limits>
 #include <optional>
+#include <set>
 #include <sstream>
 #include <thread>
 
@@ -34,6 +35,28 @@ std::int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
                std::chrono::system_clock::now().time_since_epoch())
         .count();
+}
+
+bool imported_game_matches(const import::ImportedGame& imported,
+                           std::string_view game_id) {
+    try {
+        if (import::ImportService::parse_chesscom_url(imported.source_url).game_id != game_id)
+            return false;
+        for (const std::string_view tag : {std::string_view{"Site"}, std::string_view{"Link"}}) {
+            const std::string value = imported.game.tag(tag);
+            if (value.empty()) continue;
+            try {
+                if (import::ImportService::parse_chesscom_url(value).game_id != game_id)
+                    return false;
+            } catch (const Error&) {
+                // Generic current archive tags such as `[Site "Chess.com"]`
+                // do not carry an identifier; the exact stored source URL does.
+            }
+        }
+        return true;
+    } catch (const Error&) {
+        return false;
+    }
 }
 
 std::string lowercase(std::string value) {
@@ -86,6 +109,29 @@ std::vector<std::string> path_parts(std::string_view path) {
     return result;
 }
 
+std::map<std::string, std::string> query_parameters(std::string_view path) {
+    std::map<std::string, std::string> result;
+    const std::size_t query = path.find('?');
+    if (query == std::string_view::npos)
+        return result;
+    std::string_view fields = path.substr(query + 1);
+    while (!fields.empty()) {
+        const std::size_t ampersand = fields.find('&');
+        const std::string_view field = fields.substr(0, ampersand);
+        const std::size_t equals = field.find('=');
+        if (equals == std::string_view::npos || equals == 0)
+            throw Error(ErrorCode::InvalidArgument, "query parameter is malformed");
+        const std::string key = percent_decode(field.substr(0, equals));
+        const std::string value = percent_decode(field.substr(equals + 1));
+        if (!result.emplace(key, value).second)
+            throw Error(ErrorCode::InvalidArgument, "query parameter is duplicated");
+        if (ampersand == std::string_view::npos)
+            break;
+        fields.remove_prefix(ampersand + 1);
+    }
+    return result;
+}
+
 Response json_response(int status, json::Value value) {
     return Response{
         status, {{"Content-Type", "application/json; charset=utf-8"}}, json::dump(value)};
@@ -93,6 +139,16 @@ Response json_response(int status, json::Value value) {
 
 Response error_response(int status, std::string message) {
     return json_response(status, json::Value::Object{{"error", std::move(message)}});
+}
+
+Response ingest_error(int status, std::string message, std::string code,
+                      std::vector<std::string> actions = {}) {
+    json::Value::Array encoded;
+    for (auto& action : actions)
+        encoded.emplace_back(std::move(action));
+    return json_response(status, json::Value::Object{{"error", std::move(message)},
+                                                      {"code", std::move(code)},
+                                                      {"actions", std::move(encoded)}});
 }
 
 int status_for(ErrorCode code) {
@@ -125,6 +181,14 @@ std::uint64_t parse_id(std::string_view value) {
     return result;
 }
 
+std::size_t query_size(const std::map<std::string, std::string>& query,
+                       std::string_view key, std::size_t fallback) {
+    const auto found = query.find(std::string(key));
+    if (found == query.end())
+        return fallback;
+    return static_cast<std::size_t>(parse_id(found->second));
+}
+
 std::string reason_phrase(int status) {
     switch (status) {
     case 200:
@@ -133,8 +197,12 @@ std::string reason_phrase(int status) {
         return "Accepted";
     case 400:
         return "Bad Request";
+    case 403:
+        return "Forbidden";
     case 404:
         return "Not Found";
+    case 409:
+        return "Conflict";
     case 405:
         return "Method Not Allowed";
     case 413:
@@ -448,6 +516,104 @@ Response Api::handle(const Request& request) {
         }
         if (parts == std::vector<std::string>{"api", "profile"} && request.method == "GET")
             return json_response(200, training::to_json(repository_.profile()));
+        if (parts == std::vector<std::string>{"api", "chesscom", "profile"}) {
+            if (request.method == "GET") {
+                const auto profile = repository_.chesscom_profile();
+                return profile ? json_response(200, json::Value::Object{
+                                                        {"connected", true},
+                                                        {"profile", app::to_json(*profile)}})
+                               : json_response(200, json::Value::Object{
+                                                        {"connected", false},
+                                                        {"profile", nullptr}});
+            }
+            if (request.method == "PUT") {
+                if (!ingest_)
+                    return ingest_error(503, "Chess.com ingest is unavailable",
+                                        "ingest_unavailable", {"retry"});
+                const json::Value body = json::parse(request.body);
+                for (const auto& [key, _] : body.as_object()) {
+                    if (key != "username" && key != "time_controls")
+                        return ingest_error(400,
+                                            "only a public username and time_controls are accepted",
+                                            "sensitive_fields_forbidden");
+                }
+                std::vector<std::string> controls;
+                const json::Value empty{json::Value::Array{}};
+                for (const auto& control : body.get("time_controls", empty).as_array())
+                    controls.push_back(control.as_string());
+                ingest_->configure_profile(body.at("username").as_string(),
+                                           std::move(controls));
+                return json_response(200, json::Value::Object{
+                                              {"connected", true},
+                                              {"profile", app::to_json(*ingest_->profile())}});
+            }
+        }
+        if (parts == std::vector<std::string>{"api", "chesscom", "sync"} &&
+            request.method == "POST") {
+            if (!ingest_)
+                return ingest_error(503, "Chess.com ingest is unavailable",
+                                    "ingest_unavailable", {"retry"});
+            const json::Value body = json::parse(request.body);
+            for (const auto& [key, _] : body.as_object()) {
+                if (key != "days" && key != "username")
+                    return ingest_error(400, "sync accepts only days and public username",
+                                        "sensitive_fields_forbidden");
+            }
+            try {
+                const auto sync = ingest_->start_sync(body.get("days", 30).as_int(),
+                                                      body.get("username", "").as_string());
+                return json_response(202, app::to_json(sync));
+            } catch (const app::IngestConflict& error) {
+                return ingest_error(409, error.what(), "sync_conflict", {"cancel_current"});
+            }
+        }
+        if (parts.size() == 4 && parts[0] == "api" && parts[1] == "chesscom" &&
+            parts[2] == "sync") {
+            if (!ingest_)
+                return ingest_error(503, "Chess.com ingest is unavailable",
+                                    "ingest_unavailable", {"retry"});
+            if (request.method == "GET") {
+                const auto sync = ingest_->sync(parts[3]);
+                if (!sync)
+                    return ingest_error(404, "sync does not exist", "sync_not_found");
+                return json_response(200, app::to_json(*sync));
+            }
+            if (request.method == "DELETE") {
+                if (!ingest_->cancel_sync(parts[3]))
+                    return ingest_error(404, "active sync does not exist", "sync_not_found");
+                return json_response(200, app::to_json(*ingest_->sync(parts[3])));
+            }
+        }
+        if (parts == std::vector<std::string>{"api", "chesscom", "archive"} &&
+            request.method == "GET") {
+            const auto query = query_parameters(request.path);
+            static const std::set<std::string> allowed{
+                "username", "month", "time_class", "ended_after_ms", "ended_before_ms",
+                "offset", "limit"};
+            for (const auto& [key, _] : query)
+                if (!allowed.contains(key))
+                    throw Error(ErrorCode::InvalidArgument, "unknown archive query field");
+            app::ChessComArchiveSearch search;
+            const auto field = [&](std::string_view key) {
+                const auto found = query.find(std::string(key));
+                return found == query.end() ? std::string{} : found->second;
+            };
+            search.username = field("username");
+            search.month = field("month");
+            search.time_class = field("time_class");
+            search.ended_after_ms = static_cast<std::int64_t>(query_size(query, "ended_after_ms", 0));
+            search.ended_before_ms = static_cast<std::int64_t>(query_size(query, "ended_before_ms", 0));
+            search.offset = query_size(query, "offset", 0);
+            search.limit = query_size(query, "limit", 50);
+            const auto page = repository_.search_chesscom_archive(search);
+            json::Value::Array entries;
+            for (const auto& entry : page.entries)
+                entries.push_back(app::to_json(entry));
+            return json_response(200, json::Value::Object{{"entries", std::move(entries)},
+                                                          {"next_offset", page.next_offset},
+                                                          {"has_more", page.has_more},
+                                                          {"limit", std::min(search.limit, app::chesscom_archive_search_limit)}});
+        }
         if (parts == std::vector<std::string>{"api", "storage", "snapshot"} &&
             request.method == "POST") {
             const auto path = repository_.create_snapshot();
@@ -477,7 +643,23 @@ Response Api::handle(const Request& request) {
             const json::Value body = json::parse(request.body);
             import::ImportedGame imported;
             if (body.as_object().contains("url")) {
-                imported = importer_.from_url(body.at("url").as_string());
+                const auto parsed = import::ImportService::parse_chesscom_url(
+                    body.at("url").as_string());
+                if (const auto local = repository_.chesscom_archive_entry(parsed.game_id)) {
+                    imported = importer_.from_pgn(local->pgn, local->canonical_url);
+                    if (!imported_game_matches(imported, parsed.game_id))
+                        throw Error(ErrorCode::Corruption,
+                                    "local archive PGN did not match its exact game identifier");
+                } else if (ingest_) {
+                    const auto resolution = ingest_->resolve(
+                        body.at("url").as_string(), body.get("username", "").as_string());
+                    return json_response(202, json::Value::Object{
+                                                  {"status", "resolving"},
+                                                  {"resolution_id", resolution.id},
+                                                  {"resolution", app::to_json(resolution)}});
+                } else {
+                    imported = importer_.from_url(body.at("url").as_string());
+                }
             } else if (body.as_object().contains("pgn")) {
                 imported = importer_.from_pgn(body.at("pgn").as_string());
             } else {
@@ -487,10 +669,44 @@ Response Api::handle(const Request& request) {
             const app::AnalysisJob job = jobs_.start(imported.game.identity);
             return json_response(added == app::AddResult::Added ? 202 : 200,
                                  json::Value::Object{
+                                     {"status", "imported"},
                                      {"duplicate", added == app::AddResult::Duplicate},
                                      {"game_id", imported.game.identity},
                                      {"job", app::to_json(job)},
                                  });
+        }
+        if (parts == std::vector<std::string>{"api", "import", "resolve"} &&
+            request.method == "POST") {
+            if (!ingest_)
+                return ingest_error(503, "Chess.com ingest is unavailable",
+                                    "ingest_unavailable", {"retry", "paste_pgn"});
+            const json::Value body = json::parse(request.body);
+            for (const auto& [key, _] : body.as_object()) {
+                if (key != "url" && key != "username")
+                    return ingest_error(400, "resolution accepts only url and public username",
+                                        "sensitive_fields_forbidden", {"paste_pgn"});
+            }
+            const auto resolution = ingest_->resolve(body.at("url").as_string(),
+                                                     body.get("username", "").as_string());
+            return json_response(202, app::to_json(resolution));
+        }
+        if (parts.size() == 4 && parts[0] == "api" && parts[1] == "import" &&
+            parts[2] == "resolutions") {
+            if (!ingest_)
+                return ingest_error(503, "Chess.com ingest is unavailable",
+                                    "ingest_unavailable", {"retry"});
+            if (request.method == "GET") {
+                const auto resolution = ingest_->resolution(parts[3]);
+                if (!resolution)
+                    return ingest_error(404, "resolution does not exist", "resolution_not_found");
+                return json_response(200, app::to_json(*resolution));
+            }
+            if (request.method == "DELETE") {
+                if (!ingest_->cancel_resolution(parts[3]))
+                    return ingest_error(404, "active resolution does not exist",
+                                        "resolution_not_found");
+                return json_response(200, app::to_json(*ingest_->resolution(parts[3])));
+            }
         }
         if (parts == std::vector<std::string>{"api", "import", "batch"} &&
             request.method == "POST") {
@@ -622,6 +838,10 @@ Response Api::handle(const Request& request) {
         }
         return error_response(404, "route does not exist");
     } catch (const Error& error) {
+        if (request.path.starts_with("/api/chesscom/") ||
+            request.path.starts_with("/api/import/resolve") ||
+            request.path.starts_with("/api/import/resolutions/"))
+            return ingest_error(status_for(error.code()), error.what(), "invalid_request");
         return error_response(status_for(error.code()), error.what());
     } catch (const std::exception& error) {
         log(LogLevel::Error, "api", error.what());
@@ -629,67 +849,104 @@ Response Api::handle(const Request& request) {
     }
 }
 
-HttpServer::HttpServer(Api& api, app::JobManager& jobs, ServerOptions options)
-    : api_(api), jobs_(jobs), options_(std::move(options)) {
+HttpServer::HttpServer(Api& api, app::JobManager& jobs, ServerOptions options,
+                       app::IngestManager* ingest)
+    : api_(api), jobs_(jobs), ingest_(ingest), options_(std::move(options)) {
     jobs_.set_observer([this](const app::AnalysisJob& job) {
         broadcast(
             json::dump(json::Value::Object{{"type", "job_update"}, {"job", app::to_json(job)}}));
     });
+    if (ingest_) {
+        ingest_->set_observer([this](const json::Value& update) {
+            broadcast(json::dump(update));
+        });
+    }
 }
 
 HttpServer::~HttpServer() {
     jobs_.set_observer({});
+    if (ingest_)
+        ingest_->set_observer({});
     stop();
+    std::vector<std::thread> client_threads;
+    {
+        std::lock_guard lock(client_threads_mutex_);
+        client_threads.swap(client_threads_);
+    }
+    for (auto& thread : client_threads)
+        if (thread.joinable())
+            thread.join();
 }
 
 void HttpServer::run() {
-    listen_fd_ = socket(AF_INET, SOCK_STREAM, 0);
-    if (listen_fd_ < 0)
+    const int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (listen_fd < 0)
         throw Error(ErrorCode::IoError, "failed to create HTTP socket");
+    int unpublished = -1;
+    if (!listen_fd_.compare_exchange_strong(unpublished, listen_fd,
+                                            std::memory_order_release,
+                                            std::memory_order_relaxed)) {
+        close(listen_fd);
+        throw Error(ErrorCode::IoError, "HTTP server is already running");
+    }
+    const auto close_listener = [&] {
+        int published = listen_fd;
+        if (listen_fd_.compare_exchange_strong(
+                published, -1, std::memory_order_acq_rel, std::memory_order_acquire))
+            close(listen_fd);
+    };
     int reuse = 1;
-    setsockopt(listen_fd_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(options_.port);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    if (bind(listen_fd_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+    if (bind(listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
         const std::string message = std::strerror(errno);
-        stop();
+        close_listener();
         throw Error(ErrorCode::IoError,
                     "failed to bind 127.0.0.1:" + std::to_string(options_.port) + ": " + message);
     }
-    if (listen(listen_fd_, 32) != 0) {
-        stop();
+    sockaddr_in bound_address{};
+    socklen_t bound_size = sizeof(bound_address);
+    if (getsockname(listen_fd, reinterpret_cast<sockaddr*>(&bound_address), &bound_size) != 0) {
+        close_listener();
+        throw Error(ErrorCode::IoError, "failed to read bound HTTP port");
+    }
+    if (listen(listen_fd, 32) != 0) {
+        close_listener();
         throw Error(ErrorCode::IoError, "failed to listen on HTTP socket");
     }
-    log(LogLevel::Info, "http", "listening on http://127.0.0.1:" + std::to_string(options_.port));
-    while (!stopped_) {
-        const int client = accept(listen_fd_, nullptr, nullptr);
+    const std::uint16_t actual_port = ntohs(bound_address.sin_port);
+    bound_port_.store(actual_port, std::memory_order_release);
+    log(LogLevel::Info, "http", "listening on http://127.0.0.1:" +
+                                 std::to_string(actual_port));
+    while (!stopped_.load(std::memory_order_acquire)) {
+        const int client = accept(listen_fd, nullptr, nullptr);
         if (client < 0) {
-            if (stopped_ || errno == EBADF || errno == EINVAL)
+            if (stopped_.load(std::memory_order_acquire) || errno == EBADF || errno == EINVAL)
                 break;
             if (errno == EINTR)
                 continue;
             log(LogLevel::Warning, "http", std::string("accept failed: ") + std::strerror(errno));
             continue;
         }
-        std::thread([this, client] { handle_client(client); }).detach();
+        std::lock_guard lock(client_threads_mutex_);
+        client_threads_.emplace_back([this, client] { handle_client(client); });
     }
+    close_listener();
 }
 
 void HttpServer::stop() noexcept {
-    stopped_ = true;
-    if (listen_fd_ >= 0) {
-        shutdown(listen_fd_, SHUT_RDWR);
-        close(listen_fd_);
-        listen_fd_ = -1;
+    stopped_.store(true, std::memory_order_release);
+    const int listen_fd = listen_fd_.exchange(-1, std::memory_order_acq_rel);
+    if (listen_fd >= 0) {
+        static_cast<void>(shutdown(listen_fd, SHUT_RDWR));
+        close(listen_fd);
     }
     std::lock_guard lock(clients_mutex_);
-    for (const int client : websocket_clients_) {
-        shutdown(client, SHUT_RDWR);
-        close(client);
-    }
-    websocket_clients_.clear();
+    for (const int client : websocket_clients_)
+        static_cast<void>(shutdown(client, SHUT_RDWR));
 }
 
 void HttpServer::handle_client(int client_fd) {
@@ -732,6 +989,16 @@ void HttpServer::handle_client(int client_fd) {
 }
 
 void HttpServer::handle_websocket(int client_fd, const Request& request) {
+    const auto origin = request.headers.find("origin");
+    if (origin == request.headers.end() || !valid_websocket_origin(origin->second)) {
+        constexpr std::string_view forbidden =
+            "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+        static_cast<void>(send_all(client_fd, forbidden.data(), forbidden.size()));
+        close(client_fd);
+        return;
+    }
+    timeval send_timeout{1, 0};
+    setsockopt(client_fd, SOL_SOCKET, SO_SNDTIMEO, &send_timeout, sizeof(send_timeout));
     const auto key = request.headers.find("sec-websocket-key");
     if (key == request.headers.end()) {
         close(client_fd);
@@ -760,8 +1027,18 @@ void HttpServer::handle_websocket(int client_fd, const Request& request) {
         close(client_fd);
         return;
     }
+    if (ingest_) {
+        const std::string ingest_snapshot = websocket_frame(json::dump(json::Value::Object{
+            {"type", "ingest_snapshot"}, {"ingest", ingest_->snapshot()}}));
+        if (!send_all(client_fd, ingest_snapshot.data(), ingest_snapshot.size())) {
+            std::lock_guard lock(clients_mutex_);
+            std::erase(websocket_clients_, client_fd);
+            close(client_fd);
+            return;
+        }
+    }
     std::array<char, 1024> buffer{};
-    while (!stopped_) {
+    while (!stopped_.load(std::memory_order_acquire)) {
         pollfd descriptor{client_fd, POLLIN, 0};
         const int ready = poll(&descriptor, 1, 1000);
         if (ready < 0 && errno == EINTR)
@@ -788,6 +1065,26 @@ void HttpServer::broadcast(std::string_view message) {
     std::lock_guard lock(clients_mutex_);
     std::erase_if(websocket_clients_,
                   [&](int client) { return !send_all(client, frame.data(), frame.size()); });
+}
+
+bool HttpServer::valid_websocket_origin(std::string_view origin) {
+    constexpr std::array<std::string_view, 2> allowed = {
+        "http://127.0.0.1", "http://localhost"};
+    for (const auto prefix : allowed) {
+        if (origin == prefix)
+            return true;
+        if (!origin.starts_with(prefix) || origin.size() <= prefix.size() ||
+            origin[prefix.size()] != ':')
+            continue;
+        const std::string_view port = origin.substr(prefix.size() + 1);
+        if (port.empty() || port.size() > 5)
+            return false;
+        unsigned value = 0;
+        const auto parsed = std::from_chars(port.data(), port.data() + port.size(), value);
+        return parsed.ec == std::errc{} && parsed.ptr == port.data() + port.size() &&
+               value > 0 && value <= 65535;
+    }
+    return false;
 }
 
 Response HttpServer::static_file(std::string_view request_path) const {
