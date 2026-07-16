@@ -31,6 +31,20 @@ security checks, and a clean macOS package smoke:
 - Reproducible benchmarks, Instruments profiling, sanitizer/race workflows, and diagnostics API.
 - Reproducible macOS app bundle, local backup/restore utility, and clean-install qualification.
 
+### Restructure status
+
+**Phase 1 — Frictionless Chess.com ingest was completed on 2026-07-16.** The service now
+canonicalizes live, daily, and analysis links; discovers both players from a public game page;
+resolves the exact game through Chess.com's public monthly archives; caches it locally; and starts
+interactive Stockfish analysis. Public-profile synchronization supports bounded 7, 30, and 90 day
+windows with durable checkpoints, cancellation, restart recovery, and lower priority than the game
+the user is actively opening.
+
+The supplied regression URL, `https://www.chess.com/game/live/171626462440`, resolves from a fresh
+no-profile instance by identifying `superking116` from the public page and importing the exact
+archive PGN. Phase 1 intentionally made no browser UI or visual-design changes; the import/profile
+controls and review redesign remain Phase 2 work in [`RESTRUCTURE_PLAN.md`](RESTRUCTURE_PLAN.md).
+
 ## Architecture
 
 ```text
@@ -115,6 +129,7 @@ Useful server options:
 --workers count    isolated Stockfish and game workers (default: 2, maximum: 16)
 --max-pending n    bounded job and engine admission limit (default: 256)
 --retry-limit n    retries after an isolated engine failure (default: 1)
+--chesscom-username public Chess.com username used for optional archive synchronization
 --tactical-corpus  optional provenance-tracked local corpus manifest
 --no-tactical-corpus  disable supplemental public puzzles
 ```
@@ -154,6 +169,9 @@ script has also been run successfully: it packages the app, launches it on loopb
 isolated data directory, imports and analyzes the demo PGN, restarts, and reopens the persisted
 game. `scripts/real-stockfish-smoke.sh` verifies the same demo import through the HTTP server
 using the installed real Stockfish binary.
+
+Phase 1 additionally passes its dedicated archive-client, persistence, API, scheduler, restart,
+and exact-link integration suites under normal, Address/UndefinedBehavior, and Thread sanitizers.
 
 ## macOS Package
 
