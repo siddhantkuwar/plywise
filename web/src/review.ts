@@ -1,18 +1,6 @@
 import type { MoveAssessment } from "./types";
-
-export type ReviewMode = "manual" | "playing" | "try" | "reveal" | "variation";
-
-export const routineClassifications = new Set(["Book", "Best", "Excellent", "Good"]);
-export const positiveClassifications = new Set(["Brilliant", "Great"]);
-export const blockingClassifications = new Set(["Mistake", "Miss", "Blunder"]);
-
-export function autoplayDelay(move: MoveAssessment | undefined): number | null {
-  if (!move) return null;
-  if (blockingClassifications.has(move.classification)) return null;
-  if (positiveClassifications.has(move.classification)) return 1500;
-  if (move.classification === "Inaccuracy") return 850;
-  return 380;
-}
+import { blockingClassifications, positiveClassifications } from "./review/state-machine";
+export * from "./review/state-machine";
 
 export function firstReviewPly(moveCount: number): number {
   return moveCount > 0 ? 0 : -1;
@@ -39,6 +27,11 @@ export function acceptableMoves(move: MoveAssessment | undefined): string[] {
 
 export function isAcceptedTry(move: MoveAssessment | undefined, uci: string): boolean {
   return acceptableMoves(move).includes(uci.trim().toLowerCase());
+}
+
+export function acceptedSquareMove(move: MoveAssessment | undefined, source: string, destination: string): string | null {
+  const prefix = `${source}${destination}`.toLowerCase();
+  return acceptableMoves(move).find((candidate) => candidate.startsWith(prefix)) ?? null;
 }
 
 export function isKeyMove(move: MoveAssessment | undefined): boolean {

@@ -1,0 +1,22 @@
+:root {
+  --studio-bg: #10110f;
+  --studio-panel: #181916;
+  --studio-panel-strong: #20211d;
+  --studio-line: #30322c;
+  --studio-line-strong: #4a4d44;
+  --studio-text: #f3f2ec;
+  --studio-muted: #aaaDA4;
+  --studio-faint: #74786f;
+  --studio-accent: #8bd3b0;
+  --studio-warm: #dfb66f;
+  --studio-danger: #df7169;
+  --studio-focus: #b8e7d2;
+  --studio-radius: 5px;
+  --studio-mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --studio-sans: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+
+:focus-visible {
+  outline: 2px solid var(--studio-focus);
+  outline-offset: 2px;
+}

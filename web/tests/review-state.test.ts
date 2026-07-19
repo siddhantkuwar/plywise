@@ -1,4 +1,4 @@
-import { autoplayDelay, clampPly, classificationCounts, firstReviewPly, isAcceptedTry } from "../src/review";
+import { acceptedSquareMove, autoplayDelay, clampPly, classificationCounts, completePlaybackDwell, firstReviewPly, isAcceptedTry, startPlayback } from "../src/review";
 import type { MoveAssessment } from "../src/types";
 
 function assert(actual: unknown, expected: unknown, label: string): void {
@@ -52,7 +52,25 @@ assert(autoplayDelay(move({ classification: "Book" })), 380, "routine move speed
 assert(autoplayDelay(move({ classification: "Great" })), 1500, "positive pause");
 assert(autoplayDelay(move({ classification: "Inaccuracy" })), 850, "inaccuracy pause");
 assert(autoplayDelay(move({ classification: "Blunder" })), null, "blunder blocks autoplay");
+const adjacent = [
+  move({ ply: 0, classification: "Blunder" }),
+  move({ ply: 1, side: "black", classification: "Blunder" }),
+  move({ ply: 2, classification: "Good" }),
+];
+assert(startPlayback("paused_key_move", 0, adjacent), { mode: "transitioning_from_key_move", selectedPly: 1, delayMs: 700 }, "continue visibly advances from a paused blunder");
+assert(completePlaybackDwell("transitioning_from_key_move", 1, adjacent), { mode: "paused_key_move", selectedPly: 1, delayMs: null }, "adjacent blunder pauses after readable dwell");
+assert(startPlayback("paused_key_move", 1, adjacent), { mode: "transitioning_from_key_move", selectedPly: 2, delayMs: 700 }, "second continue never needs manual next");
+const criticalRun = [
+  move({ ply: 0, classification: "Mistake" }),
+  move({ ply: 1, side: "black", classification: "Miss" }),
+  move({ ply: 2, classification: "Blunder" }),
+];
+assert(startPlayback("paused_key_move", 0, criticalRun).selectedPly, 1, "mistake continue selects adjacent miss");
+assert(completePlaybackDwell("transitioning_from_key_move", 1, criticalRun).mode, "paused_key_move", "miss receives its own pause");
+assert(startPlayback("paused_key_move", 1, criticalRun).selectedPly, 2, "miss continue selects adjacent blunder");
+assert(completePlaybackDwell("transitioning_from_key_move", 2, criticalRun).mode, "paused_key_move", "blunder receives its own pause");
 assert(isAcceptedTry(move({ best_uci: "e2e4", acceptable_alternatives: ["d2d4"] }), "d2d4"), true, "equivalent candidate accepted");
+assert(acceptedSquareMove(move({ best_uci: "e7e8q" }), "e7", "e8"), "e7e8q", "board selection accepts promotion candidate");
 assert(classificationCounts([
   move({ side: "white", classification: "Best" }),
   move({ side: "black", classification: "Mistake" }),

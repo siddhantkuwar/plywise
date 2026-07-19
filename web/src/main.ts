@@ -1,13 +1,16 @@
 import "./styles.css";
+import "./design/tokens.css";
 import { advanceDrillHint, beginDrillSession, completeResource, generateSupplementalDrills, importBatch, importGameObservable, listGames, loadBatches, loadDiagnostics, loadDrills, loadGame, loadImportResolution, loadProfile, loadResources, loadRuntimeSettings, setQueuePaused, startAnalysis, submitDrillAttempt } from "./api";
 import { applyUciLineToFen, moveOverlayGeometry, squaresFromFen, uciSquares } from "./chess";
 import type { BoardOrientation } from "./chess";
 import { icons } from "./icons";
-import { autoplayDelay, blockingClassifications, classificationCounts, firstReviewPly, isAcceptedTry, type ReviewMode } from "./review";
+import { acceptedSquareMove, autoplayDelay, blockingClassifications, classificationCounts, completePlaybackDwell, firstReviewPly, isAcceptedTry, isPlaying, pauseForSelectedMove, startPlayback, type ReviewMode } from "./review";
+import { buildExploreEntries, inferPlayerName, ratingDelta, ratingHistory, reviewArc, type ExploreSection } from "./insights";
 import type { BatchProgress, Diagnostics, Drill, Job, MoveAssessment, Profile, ProgressSocketMessage, ResourceRecommendation, RuntimeSettings, StoredGame } from "./types";
 
 type MobileView = "review" | "moves" | "engine";
 type AppMode = "game" | "training" | "explore" | "progress";
+type InspectorTab = "line" | "graph" | "summary" | "method";
 
 interface State {
   game: StoredGame | null;
@@ -40,6 +43,12 @@ interface State {
   reviewMode: ReviewMode;
   tryMessage: string;
   variationCursor: number;
+  games: StoredGame[];
+  inspectorTab: InspectorTab;
+  exploreSection: ExploreSection;
+  selectedExploreId: string;
+  trySourceSquare: string;
+  ledgerScrollTop: number;
 }
 
 const initialFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -89,6 +98,12 @@ const state: State = {
   reviewMode: "manual",
   tryMessage: "",
   variationCursor: 0,
+  games: [],
+  inspectorTab: "line",
+  exploreSection: "Openings",
+  selectedExploreId: "",
+  trySourceSquare: "",
+  ledgerScrollTop: 0,
 };
 let autoplayTimer = 0;
 
@@ -133,7 +148,7 @@ app.addEventListener("submit", async (event) => {
 });
 
 document.addEventListener("visibilitychange", () => {
-  if (document.hidden && state.reviewMode === "playing") {
+  if (document.hidden && isPlaying(state.reviewMode)) {
     state.reviewMode = "manual";
     window.clearTimeout(autoplayTimer);
   }
@@ -146,7 +161,7 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "ArrowRight") { event.preventDefault(); navigate("next"); }
   if (event.key === "Home") { event.preventDefault(); navigate("first"); }
   if (event.key === "End") { event.preventDefault(); navigate("last"); }
-  if (event.key === " ") { event.preventDefault(); reviewAction(state.reviewMode === "playing" ? "pause" : "play"); }
+  if (event.key === " ") { event.preventDefault(); reviewAction(isPlaying(state.reviewMode) ? "pause" : "play"); }
 });
 
 function escapeHtml(value: string): string {
@@ -161,7 +176,7 @@ function escapeHtml(value: string): string {
 
 function currentFen(): string {
   if (!state.game?.game.plies.length) return initialFen;
-  if (state.reviewMode === "try" || state.reviewMode === "reveal") {
+  if (state.reviewMode === "try_move" || state.reviewMode === "revealed_move") {
     return state.game.analysis?.moves[state.selectedPly]?.fen_before ?? state.game.game.plies[state.selectedPly]?.fen_before ?? initialFen;
   }
   if (state.reviewMode === "variation") {
@@ -187,9 +202,10 @@ function boardMarkup(): string {
     <div class="board" role="grid" aria-label="Chess position">
       ${squares.map((square, index) => {
         const light = (Math.floor(index / 8) + index) % 2 === 0;
-        const selected = highlighted?.includes(square.name) ?? false;
+        const selected = (highlighted?.includes(square.name) ?? false) || state.trySourceSquare === square.name;
         const moveClass = highlighted?.[0] === square.name ? "from-square" : highlighted?.[1] === square.name ? "to-square" : "";
-        return `<div class="square ${light ? "light" : "dark"} ${selected ? "selected" : ""} ${moveClass}" role="gridcell" data-square="${square.name}">
+        const tryClass = state.trySourceSquare === square.name ? "try-source" : "";
+        return `<div class="square ${light ? "light" : "dark"} ${selected ? "selected" : ""} ${moveClass} ${tryClass}" role="gridcell" data-square="${square.name}" ${state.reviewMode === "try_move" ? `tabindex="0" aria-label="Choose ${square.name}"` : ""}>
           ${index % 8 === 0 ? `<span class="rank-coordinate">${square.rank}</span>` : ""}
           ${index >= 56 ? `<span class="file-coordinate">${square.file}</span>` : ""}
           ${pieceMarkup(square.piece, square.name)}
@@ -224,7 +240,7 @@ function pieceSvg(kind: string): string {
 }
 
 function arrowMarkup(highlighted: [string, string] | null): string {
-  if (state.reviewMode !== "reveal" || !state.highlightedUci || !highlighted) return "";
+  if (state.reviewMode !== "revealed_move" || !state.highlightedUci || !highlighted) return "";
   const geometry = moveOverlayGeometry(state.highlightedUci, state.boardOrientation);
   if (!geometry) return "";
   const { x: x1, y: y1 } = geometry.source;
@@ -320,23 +336,6 @@ function scoreMoveMarkup(index: number, san: string): string {
   </button>`;
 }
 
-function evaluationMarkup(): string {
-  const moves = state.game?.analysis?.moves ?? [];
-  const current = moves[state.selectedPly];
-  const values = moves.map((move) => Math.max(-600, Math.min(600, move.evaluation_after)));
-  const points = values.map((value, index) => {
-    const x = values.length <= 1 ? 0 : (index / (values.length - 1)) * 100;
-    return `${x},${30 - value / 30}`;
-  }).join(" ");
-  return `<div class="evaluation">
-    <p>Engine evaluation after ${escapeHtml(state.game?.game.plies[state.selectedPly]?.san ?? "selected move")}</p>
-    <div class="evaluation-content"><strong>${formatEval(current?.evaluation_after)}</strong>
-      <svg viewBox="0 0 100 60" preserveAspectRatio="none" aria-label="Evaluation through the game"><line x1="0" y1="30" x2="100" y2="30"/><polyline points="${points}"/>${values.map((value, index) => `<circle data-eval-ply="${index}" tabindex="0" cx="${values.length <= 1 ? 0 : (index / (values.length - 1)) * 100}" cy="${30 - value / 30}" r="1.3"/>`).join("")}</svg>
-    </div>
-    <div class="engine-meta"><span>Depth ${current ? state.game?.analysis?.mistakes[0]?.engine.lines[0]?.depth ?? "–" : "–"}</span><span>${current?.phase ?? "waiting"}</span></div>
-  </div>`;
-}
-
 function engineWorkMarkup(): string {
   const job = state.job;
   const progress = job?.progress;
@@ -398,7 +397,7 @@ function navigationMarkup(): string {
     <button data-nav="first" aria-label="First move" ${!plies.length ? "disabled" : ""}>|‹</button>
     <button data-nav="previous" aria-label="Previous move" ${state.selectedPly <= 0 ? "disabled" : ""}>‹</button>
     <div><strong>${selected ? `${Math.floor(state.selectedPly / 2) + 1}${state.selectedPly % 2 ? "..." : "."} ${escapeHtml(selected.san)}` : "Starting position"}</strong><span>${selected ? (state.selectedPly % 2 ? "White to move" : "Black to move") : "White to move"}</span></div>
-    <button data-review-action="${state.reviewMode === "playing" ? "pause" : "play"}" class="play-control" aria-label="${state.reviewMode === "playing" ? "Pause review" : "Play guided review"}" ${!plies.length ? "disabled" : ""}>${state.reviewMode === "playing" ? "Ⅱ" : "▶"}</button>
+    <button data-review-action="${isPlaying(state.reviewMode) ? "pause" : "play"}" class="play-control" aria-label="${isPlaying(state.reviewMode) ? "Pause review" : state.reviewMode === "paused_key_move" ? "Continue review" : "Play guided review"}" ${!plies.length ? "disabled" : ""}>${isPlaying(state.reviewMode) ? "Ⅱ" : "▶"}</button>
     <button data-nav="next" aria-label="Next move" ${state.selectedPly >= plies.length - 1 ? "disabled" : ""}>›</button>
     <button data-nav="last" aria-label="Last move" ${!plies.length ? "disabled" : ""}>›|</button>
     <button data-flip aria-label="Flip board" title="Flip board">↻</button>
@@ -456,9 +455,9 @@ function titleCase(value: string): string {
 }
 
 function betterMoveMarkup(move: MoveAssessment, blocking: boolean): string {
-  if (state.reviewMode === "try") return `<section class="better-move try-panel"><h4>Find a better move</h4><p>The board is restored to the position before ${escapeHtml(move.played_san || move.san)}. Enter a UCI move; equivalent engine candidates are accepted.</p><form id="try-move-form"><input id="try-move" pattern="[a-h][1-8][a-h][1-8][qrbn]?" placeholder="e2e4" required><button>Check move</button></form><p role="status">${escapeHtml(state.tryMessage)}</p><button class="text-action" data-review-action="cancel">Return to game</button></section>`;
-  if (state.reviewMode === "reveal" || state.reviewMode === "variation") return `<section class="better-move reveal-panel"><h4>${state.reviewMode === "variation" ? "Principal variation" : "Engine recommendation"}</h4><strong>${escapeHtml(move.best_san || move.best_uci)}</strong><p>${formatEval(move.evaluation_after_best)} instead of ${formatEval(move.evaluation_after)}.</p>${move.principal_variation.length ? `<ol>${move.principal_variation.slice(0, 8).map((pv, index) => `<li class="${index < state.variationCursor ? "played" : ""}">${escapeHtml(pv)}</li>`).join("")}</ol>` : ""}<div>${state.reviewMode === "variation" ? `<button data-review-action="variation-previous" ${state.variationCursor <= 0 ? "disabled" : ""}>Previous</button><button data-review-action="variation-next" ${state.variationCursor >= move.principal_variation.length ? "disabled" : ""}>Next</button>` : `<button data-review-action="variation" ${!move.principal_variation.length ? "disabled" : ""}>Play continuation</button>`}<button class="text-action" data-review-action="cancel">Return to game</button></div></section>`;
-  return `<div class="better-actions"><button data-review-action="try">Try the better move</button><button data-review-action="reveal">Reveal best move</button>${blocking ? `<small>Guided review pauses here until you continue.</small>` : ""}</div>`;
+  if (state.reviewMode === "try_move") return `<section class="better-move try-panel"><h4>Find a better move</h4><p>The board is restored to the position before ${escapeHtml(move.played_san || move.san)}. Choose a source and destination on the board, or enter UCI below. Equivalent engine candidates are accepted.</p><form id="try-move-form"><input id="try-move" pattern="[a-h][1-8][a-h][1-8][qrbn]?" placeholder="e2e4" aria-label="Move in UCI" required><button>Check move</button></form><p role="status">${escapeHtml(state.tryMessage)}</p><button class="text-action" data-review-action="cancel">Return to game</button></section>`;
+  if (state.reviewMode === "revealed_move" || state.reviewMode === "variation") return `<section class="better-move reveal-panel"><h4>${state.reviewMode === "variation" ? "Principal variation" : "Engine recommendation"}</h4><strong>${escapeHtml(move.best_san || move.best_uci)}</strong><p>${formatEval(move.evaluation_after_best)} instead of ${formatEval(move.evaluation_after)}.</p>${move.principal_variation.length ? `<ol>${move.principal_variation.slice(0, 8).map((pv, index) => `<li class="${index < state.variationCursor ? "played" : ""}">${escapeHtml(pv)}</li>`).join("")}</ol>` : ""}<div>${state.reviewMode === "variation" ? `<button data-review-action="variation-previous" ${state.variationCursor <= 0 ? "disabled" : ""}>Previous</button><button data-review-action="variation-next" ${state.variationCursor >= move.principal_variation.length ? "disabled" : ""}>Next</button>` : `<button data-review-action="variation" ${!move.principal_variation.length ? "disabled" : ""}>Play continuation</button>`}<button class="text-action" data-review-action="cancel">Return to game</button></div></section>`;
+  return `<div class="better-actions"><button data-review-action="try">Study this move</button><button data-review-action="reveal">Reveal best move</button>${blocking ? `<button class="continue-review" data-review-action="play">Continue review</button>` : ""}</div>`;
 }
 
 function classificationSummaryMarkup(): string {
@@ -467,6 +466,41 @@ function classificationSummaryMarkup(): string {
   const white = classificationCounts(moves, "white");
   const black = classificationCounts(moves, "black");
   return `<details class="classification-summary"><summary>Game classification summary</summary><div class="summary-table"><span>Move</span><strong>White</strong><strong>Black</strong>${order.map((label) => `<span class="classification-${classificationClass(label)}">${label}</span><b>${white[label] ?? 0}</b><b>${black[label] ?? 0}</b>`).join("")}</div></details>`;
+}
+
+function evaluationRailMarkup(): string {
+  const move = state.game?.analysis?.moves[state.selectedPly];
+  const value = Math.max(-600, Math.min(600, move?.evaluation_after ?? 0));
+  const whiteShare = Math.max(4, Math.min(96, 50 + value / 12));
+  return `<aside class="evaluation-rail" aria-label="Current engine evaluation">
+    <span class="eval-score">${formatEval(move?.evaluation_after)}</span>
+    <div class="eval-meter"><i style="height:${whiteShare}%"></i></div>
+    <span class="eval-side">White</span>
+  </aside>`;
+}
+
+function evaluationGraphMarkup(): string {
+  const moves = state.game?.analysis?.moves ?? [];
+  const values = moves.map((move) => Math.max(-600, Math.min(600, move.evaluation_after)));
+  const points = values.map((value, index) => `${values.length <= 1 ? 0 : (index / (values.length - 1)) * 100},${30 - value / 30}`).join(" ");
+  return `<div class="inspector-graph"><svg viewBox="0 0 100 60" preserveAspectRatio="none" aria-label="Evaluation through the game"><line x1="0" y1="30" x2="100" y2="30"/><polyline points="${points}"/>${values.map((value, index) => `<circle class="${index === state.selectedPly ? "selected" : ""}" data-eval-ply="${index}" tabindex="0" cx="${values.length <= 1 ? 0 : (index / (values.length - 1)) * 100}" cy="${30 - value / 30}" r="${index === state.selectedPly ? 2 : 1.2}"/>`).join("")}</svg><p>Selected marker follows the board and scoresheet.</p></div>`;
+}
+
+function inspectorMarkup(): string {
+  const move = state.game?.analysis?.moves[state.selectedPly];
+  const tabs: Array<[InspectorTab, string]> = [["line", "Line"], ["graph", "Graph"], ["summary", "Summary"], ["method", "Method"]];
+  let content = "";
+  if (state.inspectorTab === "line") {
+    content = `<div class="inspector-line">${engineWorkMarkup()}<div class="pv-line"><small>Selected position</small><strong>${escapeHtml(move?.best_san || move?.best_uci || "Waiting for analysis")}</strong><code>${escapeHtml(move?.principal_variation.join(" ") || "No principal variation available yet")}</code></div></div>`;
+  }
+  if (state.inspectorTab === "graph") content = evaluationGraphMarkup();
+  if (state.inspectorTab === "summary") {
+    const analysis = state.game?.analysis;
+    const totals = classificationSummaryMarkup().replace("<details class=\"classification-summary\"><summary>Game classification summary</summary>", "<section class=\"classification-summary open\"><h3>Game classification summary</h3>").replace("</details>", "</section>");
+    content = `${totals}<div class="opening-facts"><span>Opening</span><strong>${escapeHtml([analysis?.eco, analysis?.opening].filter(Boolean).join(" · ") || "Unclassified")}</strong><span>Known book</span><strong>${analysis?.book_ply ?? 0} plies</strong><span>Departure</span><strong>${analysis?.departure_ply === null || analysis?.departure_ply === undefined ? "Stayed in reference" : `Ply ${analysis.departure_ply + 1}`}</strong></div>`;
+  }
+  if (state.inspectorTab === "method") content = `<div class="method-note"><h3>What these labels mean</h3><p>Positions are reconstructed from the imported PGN, scanned locally, then deeper candidates are verified with Stockfish. The interface exposes telemetry and evidence, not private reasoning.</p><dl><div><dt>Engine</dt><dd>${escapeHtml(move?.engine_version || "Stockfish local")}</dd></div><div><dt>Classification</dt><dd>${escapeHtml(move?.classification_model_version || "Tutor Classification Model 1")}</dd></div><div><dt>Opening reference</dt><dd>${escapeHtml(move?.book_version || state.game?.analysis?.opening_book_version || "Not used for this move")}</dd></div><div><dt>Depth</dt><dd>${move?.depth || "—"}</dd></div></dl></div>`;
+  return `<section class="analysis-inspector"><nav role="tablist" aria-label="Analysis inspector">${tabs.map(([key, label]) => `<button role="tab" aria-selected="${state.inspectorTab === key}" class="${state.inspectorTab === key ? "active" : ""}" data-inspector-tab="${key}">${label}</button>`).join("")}</nav><div class="inspector-content" role="tabpanel">${content}</div></section>`;
 }
 
 function mobileTabsMarkup(): string {
@@ -494,7 +528,12 @@ function render(): void {
     bindTrainingEvents();
     return;
   }
-  if (state.mode !== "game") {
+  if (state.mode === "progress") {
+    app.innerHTML = progressShellMarkup();
+    bindTrainingEvents();
+    return;
+  }
+  if (state.mode === "training") {
     app.innerHTML = trainingShellMarkup();
     bindTrainingEvents();
     return;
@@ -502,24 +541,45 @@ function render(): void {
   const serviceOffline = state.error === "Local API service is not running.";
   app.innerHTML = `<div class="app-shell">
     <header class="app-header"><a href="/" class="brand"><span class="brand-mark" aria-hidden="true">${pieceSvg("knight")}</span><span>Personal Chess Tutor<small>Local analysis studio</small></span></a><nav><button data-mode="game" class="active" aria-current="page"><span>Review</span></button><button data-mode="explore"><span>Explore</span></button><button data-mode="progress"><span>Progress</span></button></nav><button class="menu-button" aria-label="Menu">${icons.menu}</button></header>
-    <main class="workspace ${state.mobileView}">
+    <main class="workspace studio-workspace ${state.mobileView}">
       <button class="import-bar" id="open-import">${icons.upload}<span><strong>${state.busy ? "Resolving game" : "Import a game"}</strong><small>Chess.com link or PGN</small></span>${icons.chevron}</button>
       ${importLoadingMarkup()}
       <div class="summary-region">${gameSummaryMarkup()}</div>
-      <section class="board-region"><div class="board-stage">${boardMarkup()}</div>${navigationMarkup()}${mobileTabsMarkup()}</section>
-      <aside id="moves-panel" role="tabpanel" class="analysis-region panel-slot">${moveListMarkup()}${evaluationMarkup()}${classificationSummaryMarkup()}</aside>
-      <div id="review-panel" role="tabpanel" class="review-region panel-slot">${reviewMarkup()}</div>
-      <div id="engine-panel" role="tabpanel" class="engine-region panel-slot">${engineWorkMarkup()}</div>
+      <section class="review-stage"><div class="board-column"><div class="board-with-eval">${evaluationRailMarkup()}<div class="board-region"><div class="board-stage">${boardMarkup()}</div>${navigationMarkup()}</div></div><div id="review-panel" class="review-region panel-slot">${reviewMarkup()}</div></div></section>
+      <aside id="moves-panel" class="analysis-region scoresheet-region panel-slot">${moveListMarkup()}</aside>
+      <div id="engine-panel" class="engine-region">${inspectorMarkup()}</div>
+      ${mobileTabsMarkup()}
     </main>
     <footer class="local-status"><span class="privacy-note">Private by design · games never leave this computer</span><span class="engine-state ${serviceOffline || state.job?.status === "failed" ? "offline" : ""}"><i></i>${serviceOffline ? "Start local API service" : state.job?.status === "failed" ? "Engine unavailable" : "Stockfish ready"}</span></footer>
   </div>
   ${importDialogMarkup()}`;
   bindEvents();
+  const ledger = document.querySelector<HTMLElement>(".move-scroll");
+  if (ledger) ledger.scrollTop = state.ledgerScrollTop;
   scheduleAutoplay();
 }
 
 function exploreShellMarkup(): string {
-  return `<div class="learning-shell explore"><header class="app-header"><a href="/" class="brand"><span class="brand-mark">♞</span><span>Personal Chess Tutor<small>Local analysis studio</small></span></a><nav><button data-mode="game"><span>Review</span></button><button data-mode="explore" class="active"><span>Explore</span></button><button data-mode="progress"><span>Progress</span></button></nav></header><main class="explore-main"><p class="overline">Phase 3 preview</p><h1>A quiet library for positions worth remembering.</h1><p>Openings, middlegames, and endgames will connect concepts directly to moments from your own games. The old daily-training dashboard is intentionally out of the primary workflow.</p><div class="explore-paths"><article><span>01</span><h2>Openings</h2><p>Plans, move trees, and departures seen in your games.</p></article><article><span>02</span><h2>Middlegames</h2><p>Structures, tactical motifs, and recurring decisions.</p></article><article><span>03</span><h2>Endgames</h2><p>Essential techniques linked to exact positions.</p></article></div><button data-mode="game" class="primary-action">Return to review</button></main></div>`;
+  const entries = buildExploreEntries(state.games);
+  const visible = entries.filter((entry) => entry.section === state.exploreSection);
+  const selected = visible.find((entry) => entry.id === state.selectedExploreId) ?? visible[0];
+  return `<div class="learning-shell studio-shell"><header class="app-header"><a href="/" class="brand"><span class="brand-mark">${pieceSvg("knight")}</span><span>Personal Chess Tutor<small>Local analysis studio</small></span></a><nav><button data-mode="game"><span>Review</span></button><button data-mode="explore" class="active"><span>Explore</span></button><button data-mode="progress"><span>Progress</span></button></nav></header><main class="explore-studio"><header class="page-intro"><p class="overline">Explore your own positions</p><h1>A working library, built from games you played.</h1><p>Every concept links back to the analyzed position that produced it.</p></header><nav class="section-tabs" aria-label="Position collection">${(["Openings", "Middlegames", "Endgames"] as ExploreSection[]).map((section) => `<button class="${section === state.exploreSection ? "active" : ""}" data-explore-section="${section}">${section}<span>${entries.filter((entry) => entry.section === section).length}</span></button>`).join("")}</nav>${selected ? `<div class="explore-layout"><aside class="concept-ledger">${visible.map((entry) => `<button class="${entry.id === selected.id ? "active" : ""}" data-explore-entry="${escapeHtml(entry.id)}"><strong>${escapeHtml(entry.title)}</strong><span>${escapeHtml(entry.purpose)}</span></button>`).join("")}</aside><section class="concept-study"><div class="mini-board board">${squaresFromFen(selected.fen).map((square, index) => `<div class="square ${(Math.floor(index / 8) + index) % 2 === 0 ? "light" : "dark"}">${pieceMarkup(square.piece, square.name)}</div>`).join("")}</div><div class="concept-copy"><p class="overline">${escapeHtml(selected.section.slice(0, -1))} concept</p><h2>${escapeHtml(selected.title)}</h2><p>${escapeHtml(selected.purpose)}</p><div class="tactical-tags">${selected.tags.map((tag) => `<span>${escapeHtml(titleCase(tag.replaceAll("_", " ")))}</span>`).join("")}</div><small>Source: ${escapeHtml(selected.source)}</small><button class="primary-action" data-open-game="${escapeHtml(selected.gameId)}" data-open-ply="${selected.ply}">Open this position in Review</button></div></section></div>` : `<section class="honest-empty"><h2>No ${state.exploreSection.toLowerCase()} yet.</h2><p>Analyze games that reach this phase and the library will assemble itself from those positions.</p><button data-mode="game" class="primary-action">Return to Review</button></section>`}</main></div>`;
+}
+
+function progressShellMarkup(): string {
+  const player = inferPlayerName(state.profile, state.games);
+  const ratings = ratingHistory(state.games, player);
+  const delta = ratingDelta(ratings);
+  const latest = ratings[ratings.length - 1];
+  const range = ratings.length ? Math.max(...ratings.map((point) => point.rating)) - Math.min(...ratings.map((point) => point.rating)) || 1 : 1;
+  const minimum = ratings.length ? Math.min(...ratings.map((point) => point.rating)) : 0;
+  const polyline = ratings.map((point, index) => `${ratings.length <= 1 ? 50 : (index / (ratings.length - 1)) * 100},${44 - ((point.rating - minimum) / range) * 34}`).join(" ");
+  const arc = reviewArc(state.games);
+  const analyzed = state.games.filter((game) => game.analysis?.moves.length);
+  const allMoves = analyzed.flatMap((game) => game.analysis?.moves ?? []);
+  const critical = allMoves.filter((move) => blockingClassifications.has(move.classification));
+  const best = allMoves.filter((move) => ["Best", "Excellent", "Great", "Brilliant"].includes(move.classification));
+  return `<div class="learning-shell studio-shell"><header class="app-header"><a href="/" class="brand"><span class="brand-mark">${pieceSvg("knight")}</span><span>Personal Chess Tutor<small>Local analysis studio</small></span></a><nav><button data-mode="game"><span>Review</span></button><button data-mode="explore"><span>Explore</span></button><button data-mode="progress" class="active"><span>Progress</span></button></nav></header><main class="progress-studio"><header class="page-intro"><p class="overline">Evidence, not a composite score</p><h1>Your chess, over time.</h1><p>Built from locally imported PGN tags and completed analyses.</p></header><section class="rating-story"><div><small>${escapeHtml(player || "Player not inferred")}</small><strong>${latest?.rating ?? "—"}</strong><span class="${delta === null ? "neutral" : delta >= 0 ? "positive" : "negative"}">${delta === null ? "30-day change needs two dated ratings" : `${delta >= 0 ? "↑" : "↓"} ${Math.abs(delta)} in the latest 30-day window`}</span></div>${ratings.length ? `<svg viewBox="0 0 100 50" preserveAspectRatio="none" aria-label="Rating history from imported games"><line x1="0" y1="44" x2="100" y2="44"/><polyline points="${polyline}"/>${ratings.map((point, index) => `<circle cx="${ratings.length <= 1 ? 50 : (index / (ratings.length - 1)) * 100}" cy="${44 - ((point.rating - minimum) / range) * 34}" r="1.5"><title>${point.rating} vs ${escapeHtml(point.opponent)}</title></circle>`).join("")}</svg>` : `<div class="rating-empty">Import dated PGNs with rating tags to see rating movement.</div>`}</section><div class="progress-grid"><section class="quality-panel"><p class="overline">Review quality</p><h2>${analyzed.length} analyzed game${analyzed.length === 1 ? "" : "s"}</h2><div class="quality-stats"><div><strong>${best.length}</strong><span>strong decisions</span></div><div><strong>${critical.length}</strong><span>critical errors</span></div><div><strong>${allMoves.length}</strong><span>classified plies</span></div></div><p>Counts are direct classifications, not a synthetic performance rating.</p></section><section class="learning-arc"><p class="overline">Recent learning arc</p><h2>Positions worth revisiting</h2>${arc.slice(0, 8).map((entry) => `<button data-open-game="${escapeHtml(entry.gameId)}" data-open-ply="${entry.largestSwingPly}"><span><strong>${escapeHtml(entry.title)}</strong><small>${escapeHtml(entry.opening)} · ${escapeHtml(entry.result)}</small></span><em>${(entry.largestSwing * 100).toFixed(1)}% swing</em></button>`).join("") || `<p>No completed analyses yet. Review a game to create the first learning marker.</p>`}</section></div></main></div>`;
 }
 
 function trainingBoardMarkup(drill: Drill | undefined): string {
@@ -605,6 +665,18 @@ async function activateDrillSession(): Promise<void> {
 
 function bindTrainingEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-mode]").forEach((button) => button.addEventListener("click", () => { state.mode = button.dataset.mode as AppMode; render(); if (state.mode === "training") void activateDrillSession(); }));
+  document.querySelectorAll<HTMLButtonElement>("[data-explore-section]").forEach((button) => button.addEventListener("click", () => {
+    state.exploreSection = button.dataset.exploreSection as ExploreSection;
+    state.selectedExploreId = "";
+    render();
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-explore-entry]").forEach((button) => button.addEventListener("click", () => {
+    state.selectedExploreId = button.dataset.exploreEntry ?? "";
+    render();
+  }));
+  document.querySelectorAll<HTMLButtonElement>("[data-open-game]").forEach((button) => button.addEventListener("click", () => {
+    void openStoredGame(button.dataset.openGame ?? "", Number(button.dataset.openPly ?? 0));
+  }));
   document.querySelectorAll<HTMLButtonElement>("[data-drill]").forEach((button) => button.addEventListener("click", () => { state.activeDrill = button.dataset.drill ?? ""; state.showPunishment = false; state.attemptMessage = ""; render(); void activateDrillSession(); }));
   document.querySelectorAll<HTMLButtonElement>("[data-resource]").forEach((button) => button.addEventListener("click", async () => { await completeResource(button.dataset.resource ?? ""); await refreshTraining(); render(); }));
   document.querySelector<HTMLButtonElement>("[data-supplemental]")?.addEventListener("click", async () => {
@@ -648,6 +720,9 @@ function bindEvents(): void {
     render();
     if (state.mode === "training") void activateDrillSession();
   }));
+  document.querySelector<HTMLElement>(".move-scroll")?.addEventListener("scroll", (event) => {
+    state.ledgerScrollTop = (event.currentTarget as HTMLElement).scrollTop;
+  });
   const importBar = document.querySelector<HTMLButtonElement>("#open-import");
   importBar?.addEventListener("click", () => {
     document.querySelector<HTMLDialogElement>("#import-dialog")?.showModal();
@@ -677,6 +752,16 @@ function bindEvents(): void {
   });
   document.querySelectorAll<SVGCircleElement>("[data-eval-ply]").forEach((point) => {
     point.addEventListener("click", () => selectPly(Number(point.dataset.evalPly)));
+    point.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") selectPly(Number(point.dataset.evalPly)); });
+  });
+  document.querySelectorAll<HTMLButtonElement>("[data-inspector-tab]").forEach((button) => button.addEventListener("click", () => {
+    state.inspectorTab = button.dataset.inspectorTab as InspectorTab;
+    render();
+  }));
+  document.querySelectorAll<HTMLElement>(".square[data-square]").forEach((square) => {
+    const choose = () => chooseTrySquare(square.dataset.square ?? "");
+    square.addEventListener("click", choose);
+    square.addEventListener("keydown", (event) => { if (event.key === "Enter" || event.key === " ") { event.preventDefault(); choose(); } });
   });
   document.querySelectorAll<HTMLButtonElement>("[data-nav]").forEach((button) => {
     button.addEventListener("click", () => navigate(button.dataset.nav ?? ""));
@@ -695,6 +780,7 @@ function bindEvents(): void {
     state.tryMessage = isAcceptedTry(move, attempt)
       ? "That works. It matches an accepted engine candidate."
       : "Not this time. Look for a move that changes the forcing sequence.";
+    state.trySourceSquare = "";
     render();
   });
   document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
@@ -721,9 +807,38 @@ function bindEvents(): void {
   });
 }
 
+function chooseTrySquare(square: string): void {
+  if (state.reviewMode !== "try_move" || !square) return;
+  if (!state.trySourceSquare) {
+    state.trySourceSquare = square;
+    state.tryMessage = `Selected ${square}. Choose a destination.`;
+    render();
+    return;
+  }
+  const move = state.game?.analysis?.moves[state.selectedPly];
+  const accepted = acceptedSquareMove(move, state.trySourceSquare, square);
+  state.tryMessage = accepted
+    ? "That works. It matches an accepted engine candidate."
+    : "Not this time. The position is unchanged—choose another source square.";
+  state.trySourceSquare = "";
+  render();
+}
+
+async function openStoredGame(gameId: string, ply: number): Promise<void> {
+  const cached = state.games.find((game) => game.game.id === gameId);
+  state.game = cached ?? await loadGame(gameId);
+  state.selectedPly = Math.max(0, Math.min(ply, state.game.game.plies.length - 1));
+  state.reviewMode = pauseForSelectedMove(state.game.analysis?.moves[state.selectedPly]);
+  state.mode = "game";
+  state.highlightedUci = "";
+  state.trySourceSquare = "";
+  state.trySourceSquare = "";
+  render();
+}
+
 function selectPly(ply: number): void {
   state.selectedPly = ply;
-  state.reviewMode = "manual";
+  state.reviewMode = pauseForSelectedMove(state.game?.analysis?.moves[ply]);
   state.highlightedUci = "";
   state.tryMessage = "";
   render();
@@ -736,22 +851,28 @@ function navigate(action: string): void {
   if (action === "next") state.selectedPly = Math.min(last, state.selectedPly + 1);
   if (action === "last") state.selectedPly = last;
   state.highlightedUci = "";
-  state.reviewMode = "manual";
+  state.reviewMode = pauseForSelectedMove(state.game?.analysis?.moves[state.selectedPly]);
   state.tryMessage = "";
+  state.trySourceSquare = "";
   render();
 }
 
 function reviewAction(action: string): void {
   const move = state.game?.analysis?.moves[state.selectedPly];
-  if (action === "play") state.reviewMode = "playing";
+  if (action === "play") {
+    const transition = startPlayback(state.reviewMode, state.selectedPly, state.game?.analysis?.moves ?? []);
+    state.reviewMode = transition.mode;
+    state.selectedPly = transition.selectedPly;
+  }
   if (action === "pause") state.reviewMode = "manual";
   if (action === "try") {
-    state.reviewMode = "try";
+    state.reviewMode = "try_move";
     state.highlightedUci = "";
     state.tryMessage = "";
+    state.trySourceSquare = "";
   }
   if (action === "reveal") {
-    state.reviewMode = "reveal";
+    state.reviewMode = "revealed_move";
     state.highlightedUci = move?.best_uci ?? "";
   }
   if (action === "variation") state.reviewMode = "variation";
@@ -759,25 +880,28 @@ function reviewAction(action: string): void {
   if (action === "variation-previous") state.variationCursor = Math.max(0, state.variationCursor - 1);
   if (action === "variation-next") state.variationCursor = Math.min(move?.principal_variation.length ?? 0, state.variationCursor + 1);
   if (action === "cancel") {
-    state.reviewMode = "manual";
+    state.reviewMode = pauseForSelectedMove(move);
     state.highlightedUci = "";
     state.tryMessage = "";
     state.variationCursor = 0;
+    state.trySourceSquare = "";
   }
   render();
 }
 
 function scheduleAutoplay(): void {
-  if (state.reviewMode !== "playing") return;
+  if (!isPlaying(state.reviewMode)) return;
   const moves = state.game?.analysis?.moves ?? [];
-  const delayMs = autoplayDelay(moves[state.selectedPly]);
-  if (delayMs === null || state.selectedPly >= moves.length - 1 || document.hidden) {
+  const delayMs = state.reviewMode === "transitioning_from_key_move" ? 700 : autoplayDelay(moves[state.selectedPly]);
+  if (delayMs === null || document.hidden) {
     state.reviewMode = "manual";
     autoplayTimer = window.setTimeout(render, 0);
     return;
   }
   autoplayTimer = window.setTimeout(() => {
-    state.selectedPly += 1;
+    const transition = completePlaybackDwell(state.reviewMode, state.selectedPly, moves);
+    state.selectedPly = transition.selectedPly;
+    state.reviewMode = transition.mode;
     state.highlightedUci = "";
     render();
   }, delayMs);
@@ -834,6 +958,7 @@ async function runImport(input: { url: string } | { pgn: string }): Promise<void
     state.selectedPly = Math.max(0, firstReviewPly(state.game.game.plies.length));
     state.reviewMode = "manual";
     state.expandedMistake = 0;
+    state.games = [state.game, ...state.games.filter((game) => game.game.id !== state.game?.game.id)];
     await refreshEngineFacts();
   } catch (error) {
     state.error = error instanceof Error ? error.message : "Import failed.";
@@ -864,6 +989,7 @@ async function refreshGame(): Promise<void> {
   if (!state.game) return;
   try {
     state.game = await loadGame(state.game.game.id);
+    state.games = [state.game, ...state.games.filter((game) => game.game.id !== state.game?.game.id)];
     state.error = "";
     render();
   } catch (error) {
@@ -906,8 +1032,9 @@ async function start(): Promise<void> {
   }, 1000);
   try {
     const games = await listGames();
-    if (games[0]) {
-      state.game = await loadGame(games[0].game.id);
+    state.games = await Promise.all(games.map((game) => loadGame(game.game.id)));
+    if (state.games[0]) {
+      state.game = state.games[0];
       state.selectedPly = Math.max(0, firstReviewPly(state.game.game.plies.length));
     }
   } catch (error) {
