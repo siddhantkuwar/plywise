@@ -130,16 +130,59 @@ engine::AnalysisResult engine_from_json(const json::Value& value) {
 }
 
 json::Value move_json(const analysis::MoveAssessment& move) {
+    json::Value::Array reasons;
+    for (const auto& reason : move.classification_reasons)
+        reasons.emplace_back(reason);
+    json::Value::Array tactical_tags;
+    for (const auto& tag : move.tactical_tags)
+        tactical_tags.emplace_back(tag);
+    json::Value::Array principal_variation;
+    for (const auto& uci : move.principal_variation)
+        principal_variation.emplace_back(uci);
+    json::Value::Array alternatives;
+    for (const auto& uci : move.acceptable_alternatives)
+        alternatives.emplace_back(uci);
     return json::Value::Object{
         {"ply", move.ply},
+        {"move_number", move.move_number},
+        {"side", move.side},
         {"san", move.san},
+        {"played_uci", move.played_uci},
+        {"played_san", move.played_san},
         {"fen_before", move.fen_before},
         {"fen_after", move.fen_after},
+        {"best_uci", move.best_uci},
+        {"best_san", move.best_san},
         {"evaluation_before", move.evaluation_before},
         {"evaluation_after", move.evaluation_after},
+        {"evaluation_after_best", move.evaluation_after_best},
+        {"expected_points_before", move.expected_points_before},
+        {"expected_points_after", move.expected_points_after},
+        {"expected_points_loss", move.expected_points_loss},
         {"loss", move.loss},
         {"material_delta", move.material_delta},
         {"quality", std::string(analysis::name(move.quality))},
+        {"classification", [&] {
+             std::string label(analysis::name(move.quality));
+             if (!label.empty())
+                 label.front() = static_cast<char>(std::toupper(
+                     static_cast<unsigned char>(label.front())));
+             return label;
+         }()},
+        {"classification_state", std::string(analysis::name(move.classification_state))},
+        {"classification_reasons", std::move(reasons)},
+        {"tactical_tags", std::move(tactical_tags)},
+        {"principal_variation", std::move(principal_variation)},
+        {"acceptable_alternatives", std::move(alternatives)},
+        {"book_source", move.book_source},
+        {"book_version", move.book_version},
+        {"depth", move.depth},
+        {"nodes", static_cast<double>(move.nodes)},
+        {"time_ms", static_cast<double>(move.time_ms)},
+        {"multipv", move.multipv},
+        {"engine_version", move.engine_version},
+        {"classification_model_version", move.classification_model_version},
+        {"expected_points_model_version", move.expected_points_model_version},
         {"phase", std::string(analysis::name(move.phase))},
         {"best_response", move.best_response},
     };
@@ -154,39 +197,114 @@ analysis::GamePhase parse_phase(std::string_view value) {
 }
 
 analysis::MoveQuality parse_quality(std::string_view value) {
-    if (value == "developing")
-        return analysis::MoveQuality::Developing;
-    if (value == "capture")
-        return analysis::MoveQuality::Capture;
-    if (value == "check")
-        return analysis::MoveQuality::Check;
-    if (value == "recapture")
-        return analysis::MoveQuality::Recapture;
-    if (value == "threat")
-        return analysis::MoveQuality::Threat;
+    std::string normalized(value);
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), [](unsigned char c) {
+        return static_cast<char>(std::tolower(c));
+    });
+    value = normalized;
+    if (value == "brilliant")
+        return analysis::MoveQuality::Brilliant;
+    if (value == "great")
+        return analysis::MoveQuality::Great;
+    if (value == "best")
+        return analysis::MoveQuality::Best;
+    if (value == "excellent")
+        return analysis::MoveQuality::Excellent;
+    if (value == "good")
+        return analysis::MoveQuality::Good;
+    if (value == "book")
+        return analysis::MoveQuality::Book;
     if (value == "inaccuracy")
         return analysis::MoveQuality::Inaccuracy;
     if (value == "mistake")
         return analysis::MoveQuality::Mistake;
+    if (value == "miss")
+        return analysis::MoveQuality::Miss;
     if (value == "blunder")
         return analysis::MoveQuality::Blunder;
-    return analysis::MoveQuality::Neutral;
+    // Legacy tactical/neutral labels were not quality judgments. They migrate to Good and are
+    // retained as tactical tags by move_from_json.
+    return analysis::MoveQuality::Good;
+}
+
+analysis::ClassificationState parse_classification_state(std::string_view value) {
+    if (value == "pending")
+        return analysis::ClassificationState::Pending;
+    if (value == "provisional")
+        return analysis::ClassificationState::Provisional;
+    return analysis::ClassificationState::Final;
+}
+
+std::vector<std::string> string_array(const json::Value& value, std::string_view key) {
+    const json::Value empty{json::Value::Array{}};
+    std::vector<std::string> result;
+    for (const auto& item : value.get(key, empty).as_array())
+        result.push_back(item.as_string());
+    return result;
 }
 
 analysis::MoveAssessment move_from_json(const json::Value& value) {
-    return analysis::MoveAssessment{
-        value.at("ply").as_size(),
-        value.at("san").as_string(),
-        value.at("fen_before").as_string(),
-        value.at("fen_after").as_string(),
-        value.at("evaluation_before").as_int(),
-        value.at("evaluation_after").as_int(),
-        value.at("loss").as_int(),
-        value.at("material_delta").as_int(),
-        parse_quality(value.at("quality").as_string()),
-        parse_phase(value.at("phase").as_string()),
-        value.at("best_response").as_string(),
-    };
+    analysis::MoveAssessment move;
+    move.ply = value.at("ply").as_size();
+    move.move_number = value.get("move_number", move.ply / 2 + 1).as_size();
+    move.side = value.get("side", move.ply % 2 == 0 ? "white" : "black").as_string();
+    move.san = value.get("san", value.get("played_san", "")).as_string();
+    move.played_san = value.get("played_san", move.san).as_string();
+    move.played_uci = value.get("played_uci", "").as_string();
+    move.fen_before = value.at("fen_before").as_string();
+    move.fen_after = value.at("fen_after").as_string();
+    move.best_uci = value.get("best_uci", "").as_string();
+    move.best_san = value.get("best_san", "").as_string();
+    move.evaluation_before = value.at("evaluation_before").as_int();
+    move.evaluation_after = value.at("evaluation_after").as_int();
+    move.evaluation_after_best =
+        value.get("evaluation_after_best", move.evaluation_before).as_int();
+    const chess::Color perspective =
+        move.side == "black" ? chess::Color::Black : chess::Color::White;
+    move.expected_points_before = value.get(
+        "expected_points_before", analysis::expected_points(move.evaluation_before, perspective))
+                                      .as_number();
+    move.expected_points_after = value.get(
+        "expected_points_after", analysis::expected_points(move.evaluation_after, perspective))
+                                     .as_number();
+    move.expected_points_loss = value.get(
+        "expected_points_loss",
+        std::max(0.0, move.expected_points_before - move.expected_points_after))
+                                    .as_number();
+    move.loss = value.get("loss", 0).as_int();
+    move.material_delta = value.get("material_delta", 0).as_int();
+    const std::string quality =
+        value.get("classification", value.get("quality", "good")).as_string();
+    move.quality = parse_quality(quality);
+    move.classification_state = parse_classification_state(
+        value.get("classification_state", "final").as_string());
+    move.classification_reasons = string_array(value, "classification_reasons");
+    move.tactical_tags = string_array(value, "tactical_tags");
+    if (quality == "developing" || quality == "capture" || quality == "check" ||
+        quality == "recapture" || quality == "threat") {
+        move.tactical_tags.push_back(quality == "developing" ? "development" : quality);
+        move.classification_reasons.push_back(
+            "legacy tactical label migrated to a secondary tag; quality defaults to good");
+    } else if (quality == "neutral") {
+        move.classification_reasons.push_back(
+            "legacy neutral label migrated to good because it was not an outcome classification");
+    }
+    move.principal_variation = string_array(value, "principal_variation");
+    move.acceptable_alternatives = string_array(value, "acceptable_alternatives");
+    move.book_source = value.get("book_source", "").as_string();
+    move.book_version = value.get("book_version", "").as_string();
+    move.depth = value.get("depth", 0).as_int();
+    move.nodes = static_cast<std::uint64_t>(value.get("nodes", 0).as_number());
+    move.time_ms = static_cast<std::uint64_t>(value.get("time_ms", 0).as_number());
+    move.multipv = value.get("multipv", 0).as_int();
+    move.engine_version = value.get("engine_version", "legacy-unreported").as_string();
+    move.classification_model_version =
+        value.get("classification_model_version", "legacy-fixed-cp-thresholds").as_string();
+    move.expected_points_model_version =
+        value.get("expected_points_model_version", "legacy-derived-on-read").as_string();
+    move.phase = parse_phase(value.get("phase", "middlegame").as_string());
+    move.best_response = value.get("best_response", "").as_string();
+    return move;
 }
 
 json::Value mistake_json(const analysis::Mistake& mistake) {

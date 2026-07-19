@@ -4,6 +4,7 @@
 #include "pct/engine/stockfish.hpp"
 
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <deque>
 #include <map>
@@ -15,20 +16,26 @@
 namespace pct::analysis {
 
 inline constexpr std::string_view opening_book_version = "2026.1";
+inline constexpr std::string_view classification_model_version =
+    "tutor-classification-model-1";
+inline constexpr std::string_view expected_points_model_version =
+    "tutor-logistic-unrated-1500-v1";
 
 enum class AnalysisStage { Parsing, ShallowScan, DeepAnalysis, Complete };
 enum class GamePhase { Opening, Middlegame, Endgame };
 enum class MoveQuality {
-    Developing,
-    Capture,
-    Check,
-    Recapture,
-    Threat,
-    Neutral,
+    Brilliant,
+    Great,
+    Best,
+    Excellent,
+    Good,
+    Book,
     Inaccuracy,
     Mistake,
+    Miss,
     Blunder,
 };
+enum class ClassificationState { Pending, Provisional, Final };
 
 struct Progress {
     AnalysisStage stage{AnalysisStage::Parsing};
@@ -38,6 +45,8 @@ struct Progress {
 };
 
 struct MoveAssessment {
+    // The original fields remain first to preserve source compatibility with existing aggregate
+    // initializers. New code should prefer the explicit contract fields below.
     std::size_t ply{0};
     std::string san;
     std::string fen_before;
@@ -46,9 +55,36 @@ struct MoveAssessment {
     int evaluation_after{0};
     int loss{0};
     int material_delta{0};
-    MoveQuality quality{MoveQuality::Neutral};
+    MoveQuality quality{MoveQuality::Good};
     GamePhase phase{GamePhase::Middlegame};
     std::string best_response;
+
+    std::size_t move_number{1};
+    std::string side{"white"};
+    std::string played_uci;
+    std::string played_san;
+    std::string best_uci;
+    std::string best_san;
+    int evaluation_after_best{0};
+    double expected_points_before{0.5};
+    double expected_points_after{0.5};
+    double expected_points_loss{0.0};
+    ClassificationState classification_state{ClassificationState::Pending};
+    std::vector<std::string> classification_reasons;
+    std::vector<std::string> tactical_tags;
+    std::vector<std::string> principal_variation;
+    std::vector<std::string> acceptable_alternatives;
+    std::string book_source;
+    std::string book_version;
+    int depth{0};
+    std::uint64_t nodes{0};
+    std::uint64_t time_ms{0};
+    int multipv{0};
+    std::string engine_version{"stockfish-local-unreported"};
+    std::string classification_model_version{
+        std::string(::pct::analysis::classification_model_version)};
+    std::string expected_points_model_version{
+        std::string(::pct::analysis::expected_points_model_version)};
 };
 
 struct Mistake {
@@ -93,7 +129,7 @@ struct AnalyzerOptions {
     int shallow_depth{10};
     int deep_depth{18};
     int candidate_threshold_cp{80};
-    std::size_t max_deep_candidates{5};
+    std::size_t max_deep_candidates{12};
     std::size_t top_mistakes{3};
 };
 
@@ -160,6 +196,11 @@ class Analyzer {
 [[nodiscard]] std::string_view name(AnalysisStage stage);
 [[nodiscard]] std::string_view name(GamePhase phase);
 [[nodiscard]] std::string_view name(MoveQuality quality);
+[[nodiscard]] std::string_view name(ClassificationState state);
+// Tutor Classification Model 1 uses a neutral, unrated logistic conversion with a 400cp scale
+// and clamps engine scores to +/-1000cp before conversion. This is local and is not CAPS2.
+[[nodiscard]] double expected_points(int evaluation_cp, chess::Color perspective);
+[[nodiscard]] MoveQuality classify_expected_points_loss(double loss);
 [[nodiscard]] OpeningMatch recognize_opening(const chess::Game& game);
 [[nodiscard]] std::string classify_tactical_motif(chess::Board board,
                                                   const chess::Move& best_move);

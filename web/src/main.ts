@@ -1,9 +1,10 @@
 import "./styles.css";
 import { advanceDrillHint, beginDrillSession, completeResource, generateSupplementalDrills, importBatch, importGameObservable, listGames, loadBatches, loadDiagnostics, loadDrills, loadGame, loadImportResolution, loadProfile, loadResources, loadRuntimeSettings, setQueuePaused, startAnalysis, submitDrillAttempt } from "./api";
-import { moveOverlayGeometry, squaresFromFen, uciSquares } from "./chess";
+import { applyUciLineToFen, moveOverlayGeometry, squaresFromFen, uciSquares } from "./chess";
 import type { BoardOrientation } from "./chess";
 import { icons } from "./icons";
-import type { BatchProgress, Diagnostics, Drill, Job, Mistake, Profile, ProgressSocketMessage, ResourceRecommendation, RuntimeSettings, StoredGame } from "./types";
+import { autoplayDelay, blockingClassifications, classificationCounts, firstReviewPly, isAcceptedTry, type ReviewMode } from "./review";
+import type { BatchProgress, Diagnostics, Drill, Job, MoveAssessment, Profile, ProgressSocketMessage, ResourceRecommendation, RuntimeSettings, StoredGame } from "./types";
 
 type MobileView = "review" | "moves" | "engine";
 type AppMode = "game" | "training" | "explore" | "progress";
@@ -36,6 +37,9 @@ interface State {
   boardOrientation: BoardOrientation;
   diagnostics: Diagnostics | null;
   runtimeSettings: RuntimeSettings | null;
+  reviewMode: ReviewMode;
+  tryMessage: string;
+  variationCursor: number;
 }
 
 const initialFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
@@ -82,7 +86,11 @@ const state: State = {
   boardOrientation: "white",
   diagnostics: null,
   runtimeSettings: null,
+  reviewMode: "manual",
+  tryMessage: "",
+  variationCursor: 0,
 };
+let autoplayTimer = 0;
 
 const root = document.querySelector<HTMLDivElement>("#app");
 if (!root) throw new Error("Application root is missing");
@@ -124,6 +132,23 @@ app.addEventListener("submit", async (event) => {
   render();
 });
 
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden && state.reviewMode === "playing") {
+    state.reviewMode = "manual";
+    window.clearTimeout(autoplayTimer);
+  }
+});
+
+document.addEventListener("keydown", (event) => {
+  if (event.target instanceof HTMLInputElement || event.target instanceof HTMLTextAreaElement) return;
+  if (state.mode !== "game" || !state.game) return;
+  if (event.key === "ArrowLeft") { event.preventDefault(); navigate("previous"); }
+  if (event.key === "ArrowRight") { event.preventDefault(); navigate("next"); }
+  if (event.key === "Home") { event.preventDefault(); navigate("first"); }
+  if (event.key === "End") { event.preventDefault(); navigate("last"); }
+  if (event.key === " ") { event.preventDefault(); reviewAction(state.reviewMode === "playing" ? "pause" : "play"); }
+});
+
 function escapeHtml(value: string): string {
   return value.replace(/[&<>'"]/g, (character) => ({
     "&": "&amp;",
@@ -136,10 +161,21 @@ function escapeHtml(value: string): string {
 
 function currentFen(): string {
   if (!state.game?.game.plies.length) return initialFen;
+  if (state.reviewMode === "try" || state.reviewMode === "reveal") {
+    return state.game.analysis?.moves[state.selectedPly]?.fen_before ?? state.game.game.plies[state.selectedPly]?.fen_before ?? initialFen;
+  }
+  if (state.reviewMode === "variation") {
+    const move = state.game.analysis?.moves[state.selectedPly];
+    if (move) return applyUciLineToFen(move.fen_before, move.principal_variation, state.variationCursor);
+  }
   return state.game.game.plies[state.selectedPly]?.fen_after ?? initialFen;
 }
 
 function activeUci(): string {
+  if (state.reviewMode === "variation") {
+    const pv = state.game?.analysis?.moves[state.selectedPly]?.principal_variation ?? [];
+    return pv[Math.max(0, state.variationCursor - 1)] ?? "";
+  }
   if (state.highlightedUci) return state.highlightedUci;
   return state.game?.game.plies[state.selectedPly]?.uci ?? "";
 }
@@ -169,7 +205,8 @@ function pieceMarkup(piece: string, squareName: string): string {
   const pieceTone = blackPieces.has(piece) ? "black-piece" : "white-piece";
   const kind = pieceKinds[piece] ?? "pawn";
   const title = `${kind} on ${squareName}`;
-  return `<span class="piece ${pieceTone}" aria-label="${title}">${pieceSvg(kind)}</span>`;
+  const side = pieceTone === "black-piece" ? "black" : "white";
+  return `<span class="piece ${pieceTone}" aria-label="${title}"><img src="/pieces/lasker/${side}_${kind}.svg" alt="" draggable="false"></span>`;
 }
 
 function pieceSvg(kind: string): string {
@@ -187,16 +224,21 @@ function pieceSvg(kind: string): string {
 }
 
 function arrowMarkup(highlighted: [string, string] | null): string {
-  if (!state.highlightedUci || !highlighted) return "";
+  if (state.reviewMode !== "reveal" || !state.highlightedUci || !highlighted) return "";
   const geometry = moveOverlayGeometry(state.highlightedUci, state.boardOrientation);
   if (!geometry) return "";
   const { x: x1, y: y1 } = geometry.source;
   const { x: x2, y: y2 } = geometry.destination;
+  const distance = Math.hypot(x2 - x1, y2 - y1) || 1;
+  const unitX = (x2 - x1) / distance;
+  const unitY = (y2 - y1) / distance;
+  const startX = x1 + unitX * 2.4;
+  const startY = y1 + unitY * 2.4;
+  const endX = x2 - unitX * 3.4;
+  const endY = y2 - unitY * 3.4;
   return `<svg class="move-arrow" viewBox="0 0 100 100" aria-hidden="true">
-    <defs><marker id="arrowhead" markerWidth="6" markerHeight="6" refX="4.5" refY="3" orient="auto"><path d="M0 0 6 3 0 6Z"/></marker></defs>
-    <circle class="arrow-origin" cx="${x1}" cy="${y1}" r="3.4"/>
-    <line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" marker-end="url(#arrowhead)"/>
-    <circle class="arrow-target" cx="${x2}" cy="${y2}" r="5.1"/>
+    <defs><marker id="arrowhead" markerUnits="userSpaceOnUse" markerWidth="4" markerHeight="4" viewBox="0 0 4 4" refX="3.5" refY="2" orient="auto"><path d="M0 0 4 2 0 4Z"/></marker></defs>
+    <line x1="${startX}" y1="${startY}" x2="${endX}" y2="${endY}" marker-end="url(#arrowhead)"/>
   </svg>`;
 }
 
@@ -244,6 +286,14 @@ function gameSummaryMarkup(): string {
   </section>`;
 }
 
+function moveClassification(index: number): MoveAssessment | undefined {
+  return state.game?.analysis?.moves[index];
+}
+
+function classificationClass(value: string): string {
+  return value.toLowerCase().replace(/[^a-z]+/g, "-");
+}
+
 function moveListMarkup(): string {
   const plies = state.game?.game.plies ?? [];
   const rows: string[] = [];
@@ -252,14 +302,22 @@ function moveListMarkup(): string {
     const black = plies[index + 1];
     rows.push(`<div class="move-row">
       <span class="move-number">${Math.floor(index / 2) + 1}</span>
-      ${white ? `<button data-ply="${index}" class="move ${state.selectedPly === index ? "current" : ""}">${escapeHtml(white.san)}</button>` : "<span></span>"}
-      ${black ? `<button data-ply="${index + 1}" class="move ${state.selectedPly === index + 1 ? "current" : ""}">${escapeHtml(black.san)}</button>` : "<span></span>"}
+      ${white ? scoreMoveMarkup(index, white.san) : "<span></span>"}
+      ${black ? scoreMoveMarkup(index + 1, black.san) : "<span></span>"}
     </div>`);
   }
-  return `<div class="move-table" aria-label="Game moves">
+  return `<div class="move-table" aria-label="Chronological game scoresheet">
     <div class="move-row move-heading"><span>#</span><span>White</span><span>Black</span></div>
     <div class="move-scroll">${rows.join("") || `<p class="empty-copy">Import a game to see its moves.</p>`}</div>
   </div>`;
+}
+
+function scoreMoveMarkup(index: number, san: string): string {
+  const assessment = moveClassification(index);
+  const label = assessment?.classification ?? "Pending";
+  return `<button data-ply="${index}" class="move classification-${classificationClass(label)} ${state.selectedPly === index ? "current" : ""}">
+    <span class="move-san">${escapeHtml(san)}</span><span class="move-label">${escapeHtml(label)}</span>
+  </button>`;
 }
 
 function evaluationMarkup(): string {
@@ -273,7 +331,7 @@ function evaluationMarkup(): string {
   return `<div class="evaluation">
     <p>Engine evaluation after ${escapeHtml(state.game?.game.plies[state.selectedPly]?.san ?? "selected move")}</p>
     <div class="evaluation-content"><strong>${formatEval(current?.evaluation_after)}</strong>
-      <svg viewBox="0 0 100 60" preserveAspectRatio="none" aria-label="Evaluation through the game"><line x1="0" y1="30" x2="100" y2="30"/><polyline points="${points}"/></svg>
+      <svg viewBox="0 0 100 60" preserveAspectRatio="none" aria-label="Evaluation through the game"><line x1="0" y1="30" x2="100" y2="30"/><polyline points="${points}"/>${values.map((value, index) => `<circle data-eval-ply="${index}" tabindex="0" cx="${values.length <= 1 ? 0 : (index / (values.length - 1)) * 100}" cy="${30 - value / 30}" r="1.3"/>`).join("")}</svg>
     </div>
     <div class="engine-meta"><span>Depth ${current ? state.game?.analysis?.mistakes[0]?.engine.lines[0]?.depth ?? "–" : "–"}</span><span>${current?.phase ?? "waiting"}</span></div>
   </div>`;
@@ -340,6 +398,7 @@ function navigationMarkup(): string {
     <button data-nav="first" aria-label="First move" ${!plies.length ? "disabled" : ""}>|‹</button>
     <button data-nav="previous" aria-label="Previous move" ${state.selectedPly <= 0 ? "disabled" : ""}>‹</button>
     <div><strong>${selected ? `${Math.floor(state.selectedPly / 2) + 1}${state.selectedPly % 2 ? "..." : "."} ${escapeHtml(selected.san)}` : "Starting position"}</strong><span>${selected ? (state.selectedPly % 2 ? "White to move" : "Black to move") : "White to move"}</span></div>
+    <button data-review-action="${state.reviewMode === "playing" ? "pause" : "play"}" class="play-control" aria-label="${state.reviewMode === "playing" ? "Pause review" : "Play guided review"}" ${!plies.length ? "disabled" : ""}>${state.reviewMode === "playing" ? "Ⅱ" : "▶"}</button>
     <button data-nav="next" aria-label="Next move" ${state.selectedPly >= plies.length - 1 ? "disabled" : ""}>›</button>
     <button data-nav="last" aria-label="Last move" ${!plies.length ? "disabled" : ""}>›|</button>
     <button data-flip aria-label="Flip board" title="Flip board">↻</button>
@@ -347,39 +406,67 @@ function navigationMarkup(): string {
 }
 
 function reviewMarkup(): string {
-  const mistakes = state.game?.analysis?.mistakes ?? [];
-  if (!mistakes.length) {
-    const waiting = state.job?.status === "failed" ? state.job.error : "Analysis will add the most consequential moments here.";
-    return `<section class="review-pane"><h2>Three moments to review</h2><div class="review-empty">${icons.book}<p>${escapeHtml(waiting)}</p></div></section>`;
-  }
-  return `<section class="review-pane"><h2>Three moments to review</h2>
-    <div class="mistakes">${mistakes.map(mistakeMarkup).join("")}</div>
-    <footer class="review-note">${icons.book}<p>Review each moment to learn what went wrong and how to play better next time.</p></footer>
+  const moves = state.game?.analysis?.moves ?? [];
+  const move = moves[state.selectedPly];
+  if (!move) return `<section class="review-pane"><header><h2>Move review</h2><span>Waiting for analysis</span></header><div class="review-empty">${icons.book}<p>Import a game to begin at White’s first move.</p></div></section>`;
+  const changed = move.best_uci && move.best_uci !== move.played_uci;
+  const blocking = blockingClassifications.has(move.classification);
+  return `<section class="review-pane classification-${classificationClass(move.classification)}">
+    <header><div><span class="classification-mark" aria-hidden="true"></span><h2>${escapeHtml(move.classification)}</h2></div><span>${escapeHtml(titleCase(move.classification_state))}</span></header>
+    <div class="move-commentary">
+      <p class="move-kicker">${move.move_number}${move.side === "white" ? "." : "…"} ${escapeHtml(move.played_san || move.san)}</p>
+      <h3>${escapeHtml(classificationHeadline(move))}</h3>
+      <p>${escapeHtml(moveExplanation(move))}</p>
+      ${move.tactical_tags.length ? `<div class="tactical-tags">${move.tactical_tags.map((tag) => `<span>${escapeHtml(titleCase(tag.replaceAll("_", " ")))}</span>`).join("")}</div>` : ""}
+      <dl class="move-facts"><div><dt>Evaluation</dt><dd>${formatEval(move.evaluation_before)} → ${formatEval(move.evaluation_after)}</dd></div><div><dt>Expected points lost</dt><dd>${(move.expected_points_loss * 100).toFixed(1)}%</dd></div><div><dt>Evidence</dt><dd>Depth ${move.depth || "–"} · ${move.classification_model_version || "Tutor model"}</dd></div></dl>
+      ${changed ? betterMoveMarkup(move, blocking) : ""}
+    </div>
   </section>`;
 }
 
-function mistakeMarkup(mistake: Mistake, index: number): string {
-  const expanded = state.expandedMistake === index;
-  const primary = mistake.engine.lines[0];
-  return `<article class="mistake ${expanded ? "expanded" : ""}">
-    <button class="mistake-heading" data-mistake="${index}" aria-expanded="${expanded}"><span class="rank">${mistake.rank}</span><span>${escapeHtml(mistake.san)}</span>${icons.chevron}</button>
-    ${expanded ? `<div class="mistake-body">
-      <h3>${escapeHtml(mistakeTitle(mistake.category))}</h3>
-      <div class="lesson-meta"><span>${escapeHtml(mistake.category)}</span><span>${formatEval(mistake.evaluation_before)} to ${formatEval(mistake.evaluation_after)}</span></div>
-      <p>${escapeHtml(mistake.explanation)}</p>
-      <button class="primary-action" data-better="${escapeHtml(mistake.better_moves[0] ?? "")}">Show better move ${icons.chevron}</button>
-      <details><summary>Engine details ${icons.chart}</summary><dl><div><dt>Depth</dt><dd>${primary?.depth ?? "–"}</dd></div><div><dt>Nodes</dt><dd>${primary?.nodes.toLocaleString() ?? "–"}</dd></div><div><dt>Line</dt><dd>${escapeHtml(primary?.moves.join(" ") ?? "Not available")}</dd></div></dl></details>
-    </div>` : ""}
-  </article>`;
+function classificationHeadline(move: MoveAssessment): string {
+  if (move.classification === "Brilliant") return "A sound idea with a real concession.";
+  if (move.classification === "Great") return "A critical move that held the position together.";
+  if (move.classification === "Book") return "Still following known opening play.";
+  if (move.classification === "Best") return "The engine’s first choice.";
+  if (move.classification === "Excellent") return "Nearly as strong as the best move.";
+  if (move.classification === "Good") return "A healthy move that keeps the game intact.";
+  if (move.classification === "Inaccuracy") return "A small opportunity slipped away.";
+  if (move.classification === "Miss") return "There was a chance to punish the previous move.";
+  if (move.classification === "Mistake") return "The position became materially harder.";
+  return "A decisive swing needs a closer look.";
 }
 
-function mistakeTitle(category: string): string {
-  const lower = category.toLowerCase();
-  if (lower.includes("queen")) return "Your queen was left undefended";
-  if (lower.includes("piece")) return "Your piece was left undefended";
-  if (lower.includes("mate")) return "A forcing mate was available";
-  if (lower.includes("capture")) return "A stronger capture was available";
-  return "This move allowed a tactical swing";
+function moveExplanation(move: MoveAssessment): string {
+  const loss = `${(move.expected_points_loss * 100).toFixed(1)}%`;
+  if (move.classification === "Book") return "This move stays inside the versioned local opening reference without giving up a meaningful share of the position.";
+  if (move.classification === "Brilliant") return "Deep verification found a sound material concession that preserved the position and was not already trivially winning.";
+  if (move.classification === "Great") return "Multi-line verification found one critical move with a clear separation from the alternatives.";
+  if (move.classification === "Best") return "This matched the engine’s leading candidate, within the model’s numerical tolerance.";
+  if (move.classification === "Excellent") return `This stayed very close to the engine’s first choice, giving up only ${loss} expected points.`;
+  if (move.classification === "Good") return `The position remains playable; the local model measures ${loss} expected-points loss.`;
+  if (move.classification === "Inaccuracy") return `A more precise move was available. The local model measures ${loss} expected-points loss.`;
+  if (move.classification === "Miss") return "Deep verification found a tactical or forced opportunity that the played move did not use.";
+  if (move.classification === "Mistake") return `The move surrendered ${loss} expected points and needs a concrete alternative.`;
+  return `The move surrendered ${loss} expected points; deep verification confirmed a decisive, explainable swing.`;
+}
+
+function titleCase(value: string): string {
+  return value.replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function betterMoveMarkup(move: MoveAssessment, blocking: boolean): string {
+  if (state.reviewMode === "try") return `<section class="better-move try-panel"><h4>Find a better move</h4><p>The board is restored to the position before ${escapeHtml(move.played_san || move.san)}. Enter a UCI move; equivalent engine candidates are accepted.</p><form id="try-move-form"><input id="try-move" pattern="[a-h][1-8][a-h][1-8][qrbn]?" placeholder="e2e4" required><button>Check move</button></form><p role="status">${escapeHtml(state.tryMessage)}</p><button class="text-action" data-review-action="cancel">Return to game</button></section>`;
+  if (state.reviewMode === "reveal" || state.reviewMode === "variation") return `<section class="better-move reveal-panel"><h4>${state.reviewMode === "variation" ? "Principal variation" : "Engine recommendation"}</h4><strong>${escapeHtml(move.best_san || move.best_uci)}</strong><p>${formatEval(move.evaluation_after_best)} instead of ${formatEval(move.evaluation_after)}.</p>${move.principal_variation.length ? `<ol>${move.principal_variation.slice(0, 8).map((pv, index) => `<li class="${index < state.variationCursor ? "played" : ""}">${escapeHtml(pv)}</li>`).join("")}</ol>` : ""}<div>${state.reviewMode === "variation" ? `<button data-review-action="variation-previous" ${state.variationCursor <= 0 ? "disabled" : ""}>Previous</button><button data-review-action="variation-next" ${state.variationCursor >= move.principal_variation.length ? "disabled" : ""}>Next</button>` : `<button data-review-action="variation" ${!move.principal_variation.length ? "disabled" : ""}>Play continuation</button>`}<button class="text-action" data-review-action="cancel">Return to game</button></div></section>`;
+  return `<div class="better-actions"><button data-review-action="try">Try the better move</button><button data-review-action="reveal">Reveal best move</button>${blocking ? `<small>Guided review pauses here until you continue.</small>` : ""}</div>`;
+}
+
+function classificationSummaryMarkup(): string {
+  const moves = state.game?.analysis?.moves ?? [];
+  const order = ["Brilliant", "Great", "Best", "Excellent", "Good", "Book", "Inaccuracy", "Mistake", "Miss", "Blunder"];
+  const white = classificationCounts(moves, "white");
+  const black = classificationCounts(moves, "black");
+  return `<details class="classification-summary"><summary>Game classification summary</summary><div class="summary-table"><span>Move</span><strong>White</strong><strong>Black</strong>${order.map((label) => `<span class="classification-${classificationClass(label)}">${label}</span><b>${white[label] ?? 0}</b><b>${black[label] ?? 0}</b>`).join("")}</div></details>`;
 }
 
 function mobileTabsMarkup(): string {
@@ -401,6 +488,7 @@ function importLoadingMarkup(): string {
 }
 
 function render(): void {
+  window.clearTimeout(autoplayTimer);
   if (state.mode === "explore") {
     app.innerHTML = exploreShellMarkup();
     bindTrainingEvents();
@@ -419,7 +507,7 @@ function render(): void {
       ${importLoadingMarkup()}
       <div class="summary-region">${gameSummaryMarkup()}</div>
       <section class="board-region"><div class="board-stage">${boardMarkup()}</div>${navigationMarkup()}${mobileTabsMarkup()}</section>
-      <aside id="moves-panel" role="tabpanel" class="analysis-region panel-slot">${moveListMarkup()}${evaluationMarkup()}</aside>
+      <aside id="moves-panel" role="tabpanel" class="analysis-region panel-slot">${moveListMarkup()}${evaluationMarkup()}${classificationSummaryMarkup()}</aside>
       <div id="review-panel" role="tabpanel" class="review-region panel-slot">${reviewMarkup()}</div>
       <div id="engine-panel" role="tabpanel" class="engine-region panel-slot">${engineWorkMarkup()}</div>
     </main>
@@ -427,6 +515,7 @@ function render(): void {
   </div>
   ${importDialogMarkup()}`;
   bindEvents();
+  scheduleAutoplay();
 }
 
 function exploreShellMarkup(): string {
@@ -586,6 +675,9 @@ function bindEvents(): void {
   document.querySelectorAll<HTMLButtonElement>("[data-ply]").forEach((button) => {
     button.addEventListener("click", () => selectPly(Number(button.dataset.ply)));
   });
+  document.querySelectorAll<SVGCircleElement>("[data-eval-ply]").forEach((point) => {
+    point.addEventListener("click", () => selectPly(Number(point.dataset.evalPly)));
+  });
   document.querySelectorAll<HTMLButtonElement>("[data-nav]").forEach((button) => {
     button.addEventListener("click", () => navigate(button.dataset.nav ?? ""));
   });
@@ -593,21 +685,17 @@ function bindEvents(): void {
     state.boardOrientation = state.boardOrientation === "white" ? "black" : "white";
     render();
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-mistake]").forEach((button) => {
-    button.addEventListener("click", () => {
-      const index = Number(button.dataset.mistake);
-      state.expandedMistake = state.expandedMistake === index ? -1 : index;
-      state.highlightedUci = "";
-      const mistake = state.game?.analysis?.mistakes[index];
-      if (mistake) state.selectedPly = mistake.ply;
-      render();
-    });
+  document.querySelectorAll<HTMLButtonElement>("[data-review-action]").forEach((button) => {
+    button.addEventListener("click", () => reviewAction(button.dataset.reviewAction ?? ""));
   });
-  document.querySelectorAll<HTMLButtonElement>("[data-better]").forEach((button) => {
-    button.addEventListener("click", () => {
-      state.highlightedUci = button.dataset.better ?? "";
-      render();
-    });
+  document.querySelector<HTMLFormElement>("#try-move-form")?.addEventListener("submit", (event) => {
+    event.preventDefault();
+    const move = state.game?.analysis?.moves[state.selectedPly];
+    const attempt = document.querySelector<HTMLInputElement>("#try-move")?.value ?? "";
+    state.tryMessage = isAcceptedTry(move, attempt)
+      ? "That works. It matches an accepted engine candidate."
+      : "Not this time. Look for a move that changes the forcing sequence.";
+    render();
   });
   document.querySelectorAll<HTMLButtonElement>("[data-view]").forEach((button) => {
     button.addEventListener("click", () => {
@@ -635,7 +723,9 @@ function bindEvents(): void {
 
 function selectPly(ply: number): void {
   state.selectedPly = ply;
+  state.reviewMode = "manual";
   state.highlightedUci = "";
+  state.tryMessage = "";
   render();
 }
 
@@ -646,7 +736,51 @@ function navigate(action: string): void {
   if (action === "next") state.selectedPly = Math.min(last, state.selectedPly + 1);
   if (action === "last") state.selectedPly = last;
   state.highlightedUci = "";
+  state.reviewMode = "manual";
+  state.tryMessage = "";
   render();
+}
+
+function reviewAction(action: string): void {
+  const move = state.game?.analysis?.moves[state.selectedPly];
+  if (action === "play") state.reviewMode = "playing";
+  if (action === "pause") state.reviewMode = "manual";
+  if (action === "try") {
+    state.reviewMode = "try";
+    state.highlightedUci = "";
+    state.tryMessage = "";
+  }
+  if (action === "reveal") {
+    state.reviewMode = "reveal";
+    state.highlightedUci = move?.best_uci ?? "";
+  }
+  if (action === "variation") state.reviewMode = "variation";
+  if (action === "variation") state.variationCursor = Math.min(1, move?.principal_variation.length ?? 0);
+  if (action === "variation-previous") state.variationCursor = Math.max(0, state.variationCursor - 1);
+  if (action === "variation-next") state.variationCursor = Math.min(move?.principal_variation.length ?? 0, state.variationCursor + 1);
+  if (action === "cancel") {
+    state.reviewMode = "manual";
+    state.highlightedUci = "";
+    state.tryMessage = "";
+    state.variationCursor = 0;
+  }
+  render();
+}
+
+function scheduleAutoplay(): void {
+  if (state.reviewMode !== "playing") return;
+  const moves = state.game?.analysis?.moves ?? [];
+  const delayMs = autoplayDelay(moves[state.selectedPly]);
+  if (delayMs === null || state.selectedPly >= moves.length - 1 || document.hidden) {
+    state.reviewMode = "manual";
+    autoplayTimer = window.setTimeout(render, 0);
+    return;
+  }
+  autoplayTimer = window.setTimeout(() => {
+    state.selectedPly += 1;
+    state.highlightedUci = "";
+    render();
+  }, delayMs);
 }
 
 async function submitImport(): Promise<void> {
@@ -697,7 +831,8 @@ async function runImport(input: { url: string } | { pgn: string }): Promise<void
       state.game = await loadGame(gameId);
       state.importStage = "analyzing";
     }
-    state.selectedPly = Math.max(0, state.game.game.plies.length - 1);
+    state.selectedPly = Math.max(0, firstReviewPly(state.game.game.plies.length));
+    state.reviewMode = "manual";
     state.expandedMistake = 0;
     await refreshEngineFacts();
   } catch (error) {
@@ -773,7 +908,7 @@ async function start(): Promise<void> {
     const games = await listGames();
     if (games[0]) {
       state.game = await loadGame(games[0].game.id);
-      state.selectedPly = Math.max(0, state.game.game.plies.length - 1);
+      state.selectedPly = Math.max(0, firstReviewPly(state.game.game.plies.length));
     }
   } catch (error) {
     state.error = error instanceof Error ? error.message : "Local service is unavailable.";

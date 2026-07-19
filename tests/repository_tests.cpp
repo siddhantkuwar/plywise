@@ -2,6 +2,7 @@
 
 #include "pct/app/repository.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <sstream>
@@ -71,6 +72,130 @@ TEST_CASE("repository deduplicates imports and replays completed analysis") {
         CHECK(restored.has_value());
         CHECK(restored->analysis.has_value());
         CHECK_EQ(restored->imported.game.plies.size(), 4ULL);
+    }
+    remove_repository_files(path);
+}
+
+TEST_CASE("repository round trips the Phase 2.1 per-ply classification contract") {
+    const auto path = repository_path();
+    remove_repository_files(path);
+    const chess::Game parsed = chess::parse_pgn(pgn);
+    const import::ImportedGame imported{
+        parsed, {}, std::string(pgn), import::ImportMethod::ManualPgn};
+    {
+        storage::EventLog log(path);
+        app::Repository repository(log);
+        CHECK(repository.add(imported) == app::AddResult::Added);
+        analysis::GameAnalysis completed;
+        completed.game_id = parsed.identity;
+        analysis::MoveAssessment move;
+        move.ply = 0;
+        move.move_number = 1;
+        move.side = "white";
+        move.san = "e4";
+        move.played_san = "e4";
+        move.played_uci = "e2e4";
+        move.fen_before = parsed.plies[0].fen_before;
+        move.fen_after = parsed.plies[0].fen_after;
+        move.best_uci = "e2e4";
+        move.best_san = "e4";
+        move.evaluation_before = 20;
+        move.evaluation_after = 18;
+        move.evaluation_after_best = 20;
+        move.expected_points_before = 0.512;
+        move.expected_points_after = 0.511;
+        move.expected_points_loss = 0.001;
+        move.quality = analysis::MoveQuality::Book;
+        move.classification_state = analysis::ClassificationState::Final;
+        move.classification_reasons = {"recognized local theory"};
+        move.tactical_tags = {"development"};
+        move.principal_variation = {"e2e4", "e7e5"};
+        move.acceptable_alternatives = {"d2d4", "e2e4"};
+        move.book_source = "local-opening-book";
+        move.book_version = "2026.1";
+        move.depth = 18;
+        move.nodes = 12345;
+        move.time_ms = 42;
+        move.multipv = 3;
+        move.engine_version = "stockfish-test";
+        completed.moves.push_back(move);
+        repository.save_analysis(completed);
+    }
+    {
+        storage::EventLog log(path);
+        app::Repository repository(log);
+        const auto restored = repository.get(parsed.identity);
+        CHECK(restored.has_value());
+        CHECK(restored->analysis.has_value());
+        const auto& move = restored->analysis->moves.front();
+        CHECK_EQ(move.played_uci, "e2e4");
+        CHECK_EQ(move.best_san, "e4");
+        CHECK(move.quality == analysis::MoveQuality::Book);
+        CHECK(move.classification_state == analysis::ClassificationState::Final);
+        CHECK_EQ(move.classification_reasons.front(), "recognized local theory");
+        CHECK_EQ(move.principal_variation.size(), 2ULL);
+        CHECK_EQ(move.acceptable_alternatives.size(), 2ULL);
+        CHECK_EQ(move.nodes, 12345ULL);
+        CHECK_EQ(move.engine_version, "stockfish-test");
+        CHECK_EQ(move.classification_model_version,
+                 std::string(analysis::classification_model_version));
+    }
+    remove_repository_files(path);
+}
+
+TEST_CASE("repository migrates legacy tactical quality labels without rejecting stored JSON") {
+    const auto path = repository_path();
+    remove_repository_files(path);
+    const chess::Game parsed = chess::parse_pgn(pgn);
+    const import::ImportedGame imported{
+        parsed, {}, std::string(pgn), import::ImportMethod::ManualPgn};
+    {
+        storage::EventLog log(path);
+        app::Repository repository(log);
+        CHECK(repository.add(imported) == app::AddResult::Added);
+    }
+    {
+        storage::EventLog log(path);
+        json::Value legacy_move{json::Value::Object{
+            {"ply", 0},
+            {"san", "e4"},
+            {"fen_before", parsed.plies[0].fen_before},
+            {"fen_after", parsed.plies[0].fen_after},
+            {"evaluation_before", 12},
+            {"evaluation_after", 10},
+            {"loss", 2},
+            {"material_delta", 0},
+            {"quality", "capture"},
+            {"phase", "opening"},
+            {"best_response", "e7e5"},
+        }};
+        json::Value::Array moves;
+        moves.push_back(std::move(legacy_move));
+        const json::Value analysis_json{json::Value::Object{
+            {"game_id", parsed.identity},
+            {"moves", std::move(moves)},
+            {"mistakes", json::Value::Array{}},
+        }};
+        static_cast<void>(log.append(
+            storage::EventType::AnalysisCompleted,
+            json::dump(json::Value::Object{{"game_id", parsed.identity},
+                                           {"analysis", analysis_json}})));
+    }
+    {
+        storage::EventLog log(path);
+        app::Repository repository(log);
+        const auto restored = repository.get(parsed.identity);
+        CHECK(restored.has_value());
+        CHECK(restored->analysis.has_value());
+        const auto& move = restored->analysis->moves.front();
+        CHECK_EQ(analysis::name(move.quality), "good");
+        CHECK(move.classification_state == analysis::ClassificationState::Final);
+        CHECK(std::find(move.tactical_tags.begin(), move.tactical_tags.end(), "capture") !=
+              move.tactical_tags.end());
+        CHECK_EQ(move.played_san, "e4");
+        CHECK_EQ(move.classification_model_version, "legacy-fixed-cp-thresholds");
+        CHECK_EQ(move.expected_points_model_version, "legacy-derived-on-read");
+        CHECK(!move.classification_reasons.empty());
     }
     remove_repository_files(path);
 }

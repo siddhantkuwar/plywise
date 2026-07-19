@@ -50,15 +50,39 @@ export interface Mistake {
 
 export interface MoveAssessment {
   ply: number;
+  move_number: number;
+  side: "white" | "black";
+  played_uci: string;
+  played_san: string;
   san: string;
   fen_before: string;
   fen_after: string;
+  best_uci: string;
+  best_san: string;
   evaluation_before: number;
   evaluation_after: number;
+  evaluation_after_best: number;
   loss: number;
+  expected_points_before: number;
+  expected_points_after: number;
+  expected_points_loss: number;
   quality: string;
+  classification: "Brilliant" | "Great" | "Best" | "Excellent" | "Good" | "Book" | "Inaccuracy" | "Mistake" | "Miss" | "Blunder";
+  classification_state: "pending" | "provisional" | "final";
+  classification_reasons: string[];
+  tactical_tags: string[];
+  principal_variation: string[];
+  acceptable_alternatives: string[];
   phase: string;
   best_response: string;
+  book_source: string;
+  book_version: string;
+  depth: number;
+  nodes: number;
+  time_ms: number;
+  multipv: number;
+  engine_version: string;
+  classification_model_version: string;
 }
 
 export interface StoredGame {

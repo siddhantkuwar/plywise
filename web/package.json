@@ -7,7 +7,9 @@
     "dev": "vite --host 127.0.0.1",
     "build": "tsc --noEmit && vite build",
     "check": "tsc --noEmit",
-    "test:geometry": "tsc tests/chess-geometry.test.ts src/chess.ts --outDir /tmp/pct-web-geometry --module commonjs --moduleResolution node --target ES2022 --skipLibCheck && node /tmp/pct-web-geometry/tests/chess-geometry.test.js"
+    "test:geometry": "tsc tests/chess-geometry.test.ts src/chess.ts --outDir /tmp/pct-web-geometry --module commonjs --moduleResolution node --target ES2022 --skipLibCheck && node /tmp/pct-web-geometry/tests/chess-geometry.test.js",
+    "test:review": "tsc tests/review-state.test.ts src/review.ts src/types.ts --outDir /tmp/pct-web-review --module commonjs --moduleResolution node --target ES2022 --skipLibCheck && node /tmp/pct-web-review/tests/review-state.test.js",
+    "test": "npm run test:geometry && npm run test:review"
   },
   "devDependencies": {
     "typescript": "^5.7.3",

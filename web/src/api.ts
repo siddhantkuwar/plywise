@@ -51,11 +51,19 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export async function listGames(): Promise<StoredGame[]> {
   const response = await request<{ games: StoredGame[] }>("/api/games");
-  return response.games;
+  return response.games.map(normalizeStoredGame);
 }
 
-export function loadGame(id: string): Promise<StoredGame> {
-  return request<StoredGame>(`/api/games/${encodeURIComponent(id)}`);
+export async function loadGame(id: string): Promise<StoredGame> {
+  return normalizeStoredGame(await request<StoredGame>(`/api/games/${encodeURIComponent(id)}`));
+}
+
+function normalizeStoredGame(game: StoredGame): StoredGame {
+  for (const move of game.analysis?.moves ?? []) {
+    const value = String(move.classification || move.quality || "Good");
+    move.classification = `${value.charAt(0).toUpperCase()}${value.slice(1).toLowerCase()}` as typeof move.classification;
+  }
+  return game;
 }
 
 export function importGame(input: { url: string } | { pgn: string }): Promise<{
