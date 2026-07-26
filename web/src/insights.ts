@@ -1,4 +1,4 @@
-import type { Profile, StoredGame } from "./types";
+import type { Drill, Profile, StoredGame, Weakness } from "./types";
 
 export type ExploreSection = "Openings" | "Middlegames" | "Endgames";
 
@@ -31,6 +31,25 @@ export interface ReviewArcEntry {
   opening: string;
   largestSwing: number;
   largestSwingPly: number;
+}
+
+export interface HomeReview {
+  gameId: string;
+  ply: number;
+  title: string;
+  opening: string;
+  moments: number;
+}
+
+export interface HomeFocus {
+  weakness: Weakness;
+  drills: Drill[];
+}
+
+export interface HomeWeek {
+  analyzed: number;
+  practiced: number;
+  mistakeTrend: number | null;
 }
 
 const motifPurpose: Record<string, string> = {
@@ -162,6 +181,66 @@ export function reviewArc(games: StoredGame[]): ReviewArcEntry[] {
   }).sort((left, right) => (right.timestamp ?? 0) - (left.timestamp ?? 0));
 }
 
+export function homeRecentGames(games: StoredGame[], limit = 3): StoredGame[] {
+  return [...games]
+    .sort((left, right) => (gameTimestamp(right.game.tags) ?? 0) - (gameTimestamp(left.game.tags) ?? 0))
+    .slice(0, limit);
+}
+
+export function homeContinueReview(games: StoredGame[]): HomeReview | null {
+  const analyzed = homeRecentGames(games.filter((game) => game.analysis?.moves.length), games.length);
+  const latest = analyzed.find((game) => game.analysis?.moves.some((move) =>
+    ["Inaccuracy", "Mistake", "Miss", "Blunder"].includes(move.classification),
+  )) ?? analyzed[0];
+  if (!latest?.analysis) return null;
+  const attention = latest.analysis.moves.filter((move) =>
+    ["Inaccuracy", "Mistake", "Miss", "Blunder"].includes(move.classification),
+  );
+  const first = attention[0] ?? latest.analysis.moves[0];
+  if (!first) return null;
+  return {
+    gameId: latest.game.id,
+    ply: first.ply,
+    title: gameTitle(latest),
+    opening: latest.analysis.opening || "Unclassified opening",
+    moments: attention.length,
+  };
+}
+
+export function homeFocus(profile: Profile | null, drills: Drill[]): HomeFocus | null {
+  const weakness = profile?.weaknesses
+    .filter((item) => item.occurrences > 0)
+    .sort((left, right) =>
+      right.games - left.games
+      || right.occurrences - left.occurrences
+      || right.average_loss_cp - left.average_loss_cp,
+    )[0];
+  if (!weakness) return null;
+  const normalized = weakness.category.trim().toLowerCase();
+  const matching = drills
+    .filter((drill) => drill.category.trim().toLowerCase() === normalized)
+    .sort((left, right) => right.schedule.priority - left.schedule.priority)
+    .slice(0, 3);
+  return { weakness, drills: matching };
+}
+
+export function homeWeek(profile: Profile | null, now = Date.now()): HomeWeek {
+  if (!profile) return { analyzed: 0, practiced: 0, mistakeTrend: null };
+  const day = 86_400_000;
+  const currentStart = now - 7 * day;
+  const previousStart = now - 14 * day;
+  const current = profile.activity_trend.filter((item) => item.day_start_ms >= currentStart && item.day_start_ms <= now);
+  const previous = profile.activity_trend.filter((item) => item.day_start_ms >= previousStart && item.day_start_ms < currentStart);
+  const analyzed = current.reduce((sum, item) => sum + item.games_analyzed, 0);
+  const practiced = current.reduce((sum, item) => sum + item.drill_attempts, 0);
+  const currentMistakes = current.reduce((sum, item) => sum + item.mistakes, 0);
+  const previousMistakes = previous.reduce((sum, item) => sum + item.mistakes, 0);
+  const mistakeTrend = previousMistakes > 0
+    ? Math.round((currentMistakes - previousMistakes) / previousMistakes * 100)
+    : null;
+  return { analyzed, practiced, mistakeTrend };
+}
+
 export function inferPlayerName(profile: Profile | null, games: StoredGame[]): string {
   if (profile?.player_name) return profile.player_name;
   const counts = new Map<string, number>();
@@ -172,7 +251,7 @@ export function inferPlayerName(profile: Profile | null, games: StoredGame[]): s
   return [...counts.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? "";
 }
 
-function gameTimestamp(tags: Record<string, string>): number | null {
+export function gameTimestamp(tags: Record<string, string>): number | null {
   const raw = tags.UTCDate || tags.Date;
   if (!raw || !/^\d{4}\.\d{2}\.\d{2}$/.test(raw)) return null;
   const time = /^\d{2}:\d{2}:\d{2}$/.test(tags.UTCTime ?? "") ? tags.UTCTime : "00:00:00";

@@ -1,9 +1,10 @@
 import type { ReactNode } from "react";
 import { Icon, type IconName } from "./Icon";
 
-export type Route = "recent" | "analysis" | "explore" | "progress" | "settings";
+export type Route = "home" | "recent" | "analysis" | "explore" | "progress" | "settings";
 
 const navigation: Array<{ route: Route; label: string; icon: IconName }> = [
+  { route: "home", label: "Home", icon: "home" },
   { route: "recent", label: "Recent", icon: "recent" },
   { route: "analysis", label: "Analysis", icon: "analysis" },
   { route: "explore", label: "Explore", icon: "explore" },
@@ -18,7 +19,7 @@ export function AppShell({ route, onRoute, header, children }: {
 }) {
   return <div className="app-frame">
     <aside className="side-rail" aria-label="Primary navigation">
-      <button className="brand-orb" aria-label="Personal Chess Tutor" onClick={() => onRoute("recent")}>
+      <button className="brand-orb" aria-label="Personal Chess Tutor" onClick={() => onRoute("home")}>
         <img src="/pieces/lasker/white_knight.svg" alt="" />
       </button>
       <nav>
@@ -40,15 +41,16 @@ export function AppShell({ route, onRoute, header, children }: {
   </div>;
 }
 
-export function TopBar({ title, detail, meta, actions }: {
+export function TopBar({ title, detail, meta, actions, icon = "recent" }: {
   title: string;
   detail?: string;
   meta?: string;
   actions?: ReactNode;
+  icon?: IconName;
 }) {
   return <header className="top-bar">
     <div className="top-identity">
-      <Icon name="recent"/>
+      <Icon name={icon}/>
       <strong>{title}</strong>
       {detail && <><i>•</i><span>{detail}</span></>}
       {meta && <small>{meta}</small>}

@@ -1,6 +1,7 @@
 import type { ReactNode, SVGProps } from "react";
 
 export type IconName =
+  | "home"
   | "analysis"
   | "recent"
   | "explore"
@@ -27,6 +28,7 @@ export type IconName =
   | "chart";
 
 const paths: Record<IconName, ReactNode> = {
+  home: <><path d="m4 10 8-7 8 7v9a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2v-9Z"/><path d="M9 21v-7h6v7"/></>,
   analysis: <><circle cx="12" cy="12" r="7"/><path d="m17 17 4 4M9 12h6M12 9v6"/></>,
   recent: <><rect x="4" y="5" width="16" height="15" rx="3"/><path d="M8 3v4M16 3v4M4 10h16M8 14h3M13 14h3"/></>,
   explore: <><circle cx="12" cy="12" r="8"/><path d="m15.5 8.5-2 5-5 2 2-5 5-2Z"/></>,

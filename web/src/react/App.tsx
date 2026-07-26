@@ -7,7 +7,10 @@ import {
   deleteVariation,
   extendVariation,
   importGameObservable,
+  loadChessComProfile,
+  loadChessComSync,
   listGames,
+  loadDrills,
   listVariations,
   loadDiagnostics,
   loadGame,
@@ -17,26 +20,28 @@ import {
   loadRuntimeSettings,
   resetVariation,
   setVariationCursor,
+  startChessComSync,
   startAnalysis,
   submitReviewAttempt,
 } from "../api";
 import { buildExploreEntries, inferPlayerName, ratingDelta, ratingHistory, reviewArc, type ExploreSection } from "../insights";
 import { autoplayDelay, blockingClassifications, completePlaybackDwell, isPlaying, pauseForSelectedMove, startPlayback, type ReviewMode } from "../review";
 import type { BoardOrientation } from "../chess";
-import type { Diagnostics, Job, MoveAssessment, Profile, ProgressSocketMessage, RuntimeSettings, StoredGame, Variation, VariationAnalysis } from "../types";
+import type { Diagnostics, Drill, Job, MoveAssessment, Profile, ProgressSocketMessage, RuntimeSettings, StoredGame, Variation, VariationAnalysis } from "../types";
 import { ChessBoard, EvaluationBar, formatEval } from "./Board";
 import { Icon } from "./Icon";
+import { HomeView } from "./HomeView";
 import { AppShell, SoftButton, TopBar, type Route } from "./Shell";
 
 type Theme = "system" | "light" | "dark";
 type InspectorTab = "summary" | "line" | "method";
 
 const initialFen = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1";
-const routes = new Set<Route>(["recent", "analysis", "explore", "progress", "settings"]);
+const routes = new Set<Route>(["home", "recent", "analysis", "explore", "progress", "settings"]);
 
 function routeFromHash(): Route {
   const candidate = window.location.hash.replace(/^#\/?/, "") as Route;
-  return routes.has(candidate) ? candidate : "recent";
+  return routes.has(candidate) ? candidate : "home";
 }
 
 export default function App() {
@@ -44,6 +49,8 @@ export default function App() {
   const [games, setGames] = useState<StoredGame[]>([]);
   const [jobs, setJobs] = useState<Job[]>([]);
   const [profile, setProfile] = useState<Profile | null>(null);
+  const [drills, setDrills] = useState<Drill[]>([]);
+  const [chessComConnected, setChessComConnected] = useState<boolean | null>(null);
   const [diagnostics, setDiagnostics] = useState<Diagnostics | null>(null);
   const [runtimeSettings, setRuntimeSettings] = useState<RuntimeSettings | null>(null);
   const [selectedGameId, setSelectedGameId] = useState("");
@@ -71,6 +78,8 @@ export default function App() {
   const [importBusy, setImportBusy] = useState(false);
   const [importStage, setImportStage] = useState("");
   const [error, setError] = useState("");
+  const [refreshBusy, setRefreshBusy] = useState(false);
+  const [refreshMessage, setRefreshMessage] = useState("");
   const autoplayTimer = useRef<number | null>(null);
 
   const selectedGame = useMemo(() => games.find((game) => game.game.id === selectedGameId) ?? null, [games, selectedGameId]);
@@ -97,12 +106,20 @@ export default function App() {
     let cancelled = false;
     void (async () => {
       try {
-        const [listed, jobState, nextProfile] = await Promise.all([listGames(), loadJobs(), loadProfile().catch(() => null)]);
+        const [listed, jobState, nextProfile, nextDrills, chessCom] = await Promise.all([
+          listGames(),
+          loadJobs(),
+          loadProfile().catch(() => null),
+          loadDrills().catch(() => []),
+          loadChessComProfile().catch(() => null),
+        ]);
         const loaded = await Promise.all(listed.map((game) => loadGame(game.game.id)));
         if (cancelled) return;
         setGames(loaded);
         setJobs(jobState.jobs);
         setProfile(nextProfile);
+        setDrills(nextDrills);
+        setChessComConnected(chessCom?.connected ?? false);
         const initialGame = loaded.find((game) => game.analysis_status === "complete") ?? loaded[0];
         setSelectedGameId((current) => current || initialGame?.game.id || "");
         setSelectedPly(initialGame ? reviewLandingPly(initialGame) : 0);
@@ -192,6 +209,44 @@ export default function App() {
       setError(analysisError instanceof Error ? analysisError.message : "Could not start analysis.");
     }
   }, [games, openGame]);
+
+  const refreshGames = useCallback(async () => {
+    if (refreshBusy) return;
+    setRefreshBusy(true);
+    setRefreshMessage("Checking your Chess.com archive…");
+    try {
+      const connection = await loadChessComProfile();
+      setChessComConnected(connection.connected);
+      if (!connection.connected) {
+        setImportOpen(true);
+        setRefreshMessage("No Chess.com profile is connected. Import a public game to continue.");
+        return;
+      }
+      const before = games.length;
+      let sync = await startChessComSync({ days: 7 });
+      while (sync.status === "queued" || sync.status === "running") {
+        setRefreshMessage(sync.current_month ? `Checking ${sync.current_month}…` : "Refreshing recent games…");
+        await delay(350);
+        sync = await loadChessComSync(sync.id);
+      }
+      if (sync.status !== "succeeded") throw new Error(sync.error || "Refresh did not complete.");
+      const listed = await listGames();
+      const loaded = await Promise.all(listed.map((game) => loadGame(game.game.id)));
+      const [nextProfile, nextDrills] = await Promise.all([loadProfile().catch(() => null), loadDrills().catch(() => [])]);
+      setGames(loaded);
+      setProfile(nextProfile);
+      setDrills(nextDrills);
+      const imported = Math.max(0, loaded.length - before);
+      setRefreshMessage(imported ? `${imported} new game${imported === 1 ? "" : "s"} imported` : "Games are up to date");
+      setError("");
+    } catch (refreshError) {
+      const message = refreshError instanceof Error ? refreshError.message : "Could not refresh games.";
+      setRefreshMessage(message);
+      setError(message);
+    } finally {
+      setRefreshBusy(false);
+    }
+  }, [games.length, refreshBusy]);
 
   const navigate = useCallback((action: "first" | "previous" | "next" | "last") => {
     const last = Math.max(0, (selectedGame?.game.plies.length ?? 1) - 1);
@@ -395,7 +450,31 @@ export default function App() {
   let view: ReactNode;
   let header: ReactNode;
 
-  if (route === "recent") {
+  if (route === "home") {
+    const greeting = dayGreeting(new Date());
+    const libraryMessage = refreshMessage || (games.length ? `${games.length} game${games.length === 1 ? "" : "s"} available locally` : "Your local chess intelligence console");
+    header = <TopBar
+      icon="home"
+      title={greeting}
+      detail={libraryMessage}
+      meta={chessComConnected ? "Chess.com connected" : undefined}
+      actions={<SoftButton icon="retry" disabled={refreshBusy} onClick={() => void refreshGames()}>
+        {refreshBusy ? "Refreshing" : "Refresh games"}
+      </SoftButton>}
+    />;
+    view = <HomeView
+      games={games}
+      jobs={jobs}
+      profile={profile}
+      drills={drills}
+      refreshBusy={refreshBusy}
+      refreshMessage={refreshMessage}
+      onOpen={openGame}
+      onRecent={() => setAppRoute("recent")}
+      onImport={() => setImportOpen(true)}
+      onPractice={(drill) => openGame(drill.source_game_id, drill.source_ply)}
+    />;
+  } else if (route === "recent") {
     header = <TopBar title="Recent Games" detail={`${games.length} local game${games.length === 1 ? "" : "s"}`} actions={<SoftButton icon="import" onClick={() => setImportOpen(true)}>Import game</SoftButton>}/>;
     view = <RecentView
       games={games}
@@ -650,6 +729,13 @@ function needsAttention(classification: string) {
 function classificationClass(value: string) { return value.toLowerCase().replace(/[^a-z]+/g, "-"); }
 function titleCase(value: string) { return value.replace(/\b\w/g, (letter) => letter.toUpperCase()); }
 function delay(ms: number) { return new Promise((resolve) => window.setTimeout(resolve, ms)); }
+
+function dayGreeting(date: Date) {
+  const hour = date.getHours();
+  if (hour < 12) return "Good morning";
+  if (hour < 18) return "Good afternoon";
+  return "Good evening";
+}
 
 function moveExplanation(move: MoveAssessment) {
   if (move.classification_reasons[0]) return move.classification_reasons[0];
