@@ -109,3 +109,12 @@ Add a dated result table under `artifacts/benchmarks/` during the implementation
 game inputs out of Git, and summarize the selected profiles and tradeoffs in a focused PR.
 
 No engine profile becomes a product default until results are repeatable.
+
+## First spike
+
+The first three-run profile spike is recorded in
+`artifacts/benchmarks/2026-07-27-stockfish-profile-spike.md`.
+
+It keeps Stockfish.js lite single-threaded as the leading implementation candidate, rejects the
+107.8 MiB full single-threaded build for the initial alpha, and leaves the exact Quick/Balanced
+defaults open until whole-game classification parity and real browser/device evidence exist.

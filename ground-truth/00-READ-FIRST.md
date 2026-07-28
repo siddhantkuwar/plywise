@@ -55,14 +55,19 @@ blocked until the Chess.com integration boundary is clarified in writing.
 - `WEB_ROADMAP.md`: phases, deliverables, and exit criteria.
 - `WEB_ARCHITECTURE.md`: browser, C++, persistence, identity, and engine boundaries.
 - `ENGINE_BENCHMARK_PLAN.md`: browser/native comparison and profile-selection evidence.
+- `HOSTED_DATA_MODEL.md`: owner-scoped repositories, PostgreSQL records, and migration slices.
+- `SECURITY_PRIVACY_BASELINE.md`: hosted security, privacy, retention, and fair-play gates.
+- `OPEN_SOURCE_COMPLIANCE.md`: license decision and third-party distribution inventory.
 - `PRODUCT_VISION.md`: users, promise, differentiation, and success.
 - `SYSTEM_ARCHITECTURE.md`: enduring ownership and service layers.
 - `ENGINEERING_RULES.md`: implementation, testing, privacy, and Git expectations.
+- `../plywise-threat-model.md`: repo-grounded hosted-product abuse paths and mitigations.
 
 ## Current phase
 
-Phase 0: define the web product, document the architecture, benchmark engine choices, establish the
-GitHub backlog, clarify licensing, and prepare the Chess.com authorization request.
+Phase 0 completion: the web architecture, backlog, initial browser-engine evidence, persistence
+seams, and security/privacy boundaries are documented. Two owner/external decisions remain visibly
+blocked: the original-code license and written Chess.com integration authorization.
 
 The local application remains the verified reference implementation while the web vertical slice is
 built incrementally.
