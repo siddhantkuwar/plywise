@@ -1,5 +1,8 @@
 # Repository Audit
 
+> Historical evidence from the local-workstation phase. It is not the current web roadmap. See
+> `00-READ-FIRST.md` and `WEB_ROADMAP.md`.
+
 Date: 2026-07-21
 
 ## Stack and commands

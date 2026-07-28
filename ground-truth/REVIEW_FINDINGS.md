@@ -1,5 +1,8 @@
 # Dedicated Review Findings
 
+> Historical findings from the workstation repair pass. Resolutions remain useful evidence, but
+> this is not the current backlog.
+
 Date: 2026-07-21
 
 This review covers every uncommitted production, test, and documentation change against

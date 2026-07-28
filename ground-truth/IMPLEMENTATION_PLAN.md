@@ -1,5 +1,8 @@
 # Ground-Truth Implementation Plan
 
+> Historical implementation plan for the completed workstation redesign. Current work is governed
+> by `WEB_ROADMAP.md`.
+
 Date: 2026-07-21
 
 ## Validated baseline

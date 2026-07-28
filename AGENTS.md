@@ -2,7 +2,13 @@
 
 ## Identity
 
-This is a **C++ systems project with a React interface**. It is a local-first macOS chess intelligence workstation, not a React app that occasionally launches Stockfish.
+Plywise is a **C++ chess systems project with a React web interface**.
+
+The primary product is a web-first, open-source chess intelligence system for completed games.
+Single-game analysis stays free. Browser Stockfish supplies the default compute, while C++ remains
+the source of chess truth.
+
+The existing local application is a verified reference implementation during the web migration.
 
 ## Required reading
 
@@ -10,103 +16,118 @@ Before product, frontend, or architecture work, read:
 
 1. `ground-truth/00-READ-FIRST.md`
 2. `ground-truth/PRODUCT_VISION.md`
-3. `ground-truth/SYSTEM_ARCHITECTURE.md`
-4. `ground-truth/CPP_RUNTIME.md`
-5. The relevant feature spec
-6. `ground-truth/DESIGN_SYSTEM.md`
-7. `ground-truth/ENGINEERING_RULES.md`
-8. `ground-truth/VISUAL_QA.md`
+3. `ground-truth/WEB_ROADMAP.md`
+4. `ground-truth/WEB_ARCHITECTURE.md`
+5. `ground-truth/ENGINE_BENCHMARK_PLAN.md` for engine work
+6. `ground-truth/SYSTEM_ARCHITECTURE.md`
+7. `ground-truth/CPP_RUNTIME.md`
+8. The relevant feature spec
+9. `ground-truth/DESIGN_SYSTEM.md`
+10. `ground-truth/ENGINEERING_RULES.md`
+11. `ground-truth/VISUAL_QA.md`
 
-Treat `ground-truth/` as authoritative. Never use `archive/` as current requirements.
+Treat `ground-truth/` as authoritative. Dated audit, review, migration, and implementation reports
+are historical evidence. Never use `archive/` as current requirements.
+
+## Product contract
+
+- Analyze completed games only.
+- Keep one-game-at-a-time analysis free.
+- Let guests complete a review without creating an account.
+- Use accounts for saved history, sync, and personal intelligence.
+- Charge, if ever necessary, only for material cost or genuinely distinct value.
+- Never collect Chess.com passwords, cookies, or private session data.
+- Keep the browser extension blocked until its Chess.com boundary is authorized.
+- Make every personal insight traceable to games, positions, versions, and sample size.
 
 ## Ownership boundary
 
 C++ owns:
 
-- Chess.com import, refresh, and normalization
-- PGN, SAN, FEN, board reconstruction, legal moves
-- Stockfish UCI lifecycle
-- Analysis queues, workers, cancellation, real progress events
-- Evaluation caching and persistent local storage
-- Move classification, opening recognition, pattern detection
-- Variation validation and player-profile aggregation
-- Future local-model interfaces
+- completed-game import, refresh, and normalization;
+- PGN, SAN, FEN, board reconstruction, and legal moves;
+- canonical games and variation validation;
+- review assembly and browser-engine observation validation;
+- server Stockfish lifecycle, queues, workers, cancellation, and real progress;
+- classification, openings, patterns, personal intelligence, and practice selection;
+- persistence contracts, version compatibility, and authorization decisions;
+- future coaching-provider interfaces.
 
 React owns:
 
-- Layout, navigation, rendering, board interaction
-- Presentation of analysis and progress
-- Settings, charts, educational UI
-- Accessibility, themes, keyboard controls
-- Transient UI state that does not define chess truth
+- layout, navigation, rendering, and board interaction intent;
+- guest and account presentation;
+- browser Stockfish worker lifecycle;
+- progress, settings, charts, and educational UI;
+- accessibility, themes, keyboard controls, and responsive behavior;
+- transient UI state that does not define chess truth.
 
-Never duplicate move legality, classification, opening truth, or pattern truth in TypeScript. Extend a typed C++ contract instead.
+Never duplicate move legality, classification, opening truth, pattern truth, or player-profile truth
+in TypeScript. Browser engine output is untrusted until C++ validates and processes it.
 
 ## Existing behavior to protect
 
-Audit and preserve the reportedly working Analysis flow:
+Preserve the working flow:
 
-- Import Chess.com game by URL
-- Show game and playthrough
-- Navigate moves
-- Show a best move
-- Launch or display analysis
-
-## Documentation migration
-
-Follow `ground-truth/REPOSITORY_MIGRATION.md`:
-
-- Inventory Markdown files.
-- Preserve README, licenses, contribution/security docs, and GitHub templates.
-- Add `/archive/` to `.gitignore` before moving anything.
-- Move only obsolete, duplicated, draft, or superseded docs.
-- Never delete historical docs merely to tidy the tree.
-- Repair links and produce a migration report.
-- Do not commit or push.
+- Import a completed Chess.com game URL or PGN.
+- Show the canonical game and playthrough.
+- Launch analysis explicitly.
+- Show real progress.
+- Navigate moves and reveal a best move.
+- Retry a mistake.
+- Create and extend legal variations.
+- Return to canonical review.
+- Recover persisted work after restart.
 
 ## Product defaults
 
-- Recent Games is the launch view.
-- Analysis starts only after the user presses Analyze.
-- Batch analysis is supported.
-- Progress reflects actual C++ stages, never a timer.
+- Home is the launch view.
+- Guest analysis is a complete first-run path.
+- Analysis begins only after explicit user action.
+- Browser Quick analysis is the free compatibility default once verified.
+- Progress reflects actual stages, never a timer.
 - Analysis is board-first with a contextual inspector.
-- Move list, eval bar, move class, opening, and accuracy are visible by default.
-- Engine lines, retry mode, automatic pattern display, and variation assistance are settings.
-- Users may branch from any historical position and play legal variations indefinitely.
-- Theme follows macOS system appearance by default.
-- Accent is navy blue.
-- Explanations are deterministic now, with a future local-model boundary.
+- Engine detail is progressively disclosed.
+- Variations never edit canonical games.
+- Theme follows the browser/system preference by default.
+- Accent remains navy blue.
+- Explanations are deterministic now, with a future optional coaching-provider boundary.
 
 ## Design constraints
 
-The interface should feel calm, intelligent, premium, and workstation-like. It must remain understandable to beginners and useful to streamers.
+The interface should feel calm, intelligent, premium, and workstation-like while working on desktop
+and mobile web.
 
 Do not produce:
 
-- A ChatGPT clone
-- A generic AI dashboard or card farm
-- Fake progress
-- Excessive gradients, glass, glow, pills, or giant whitespace
-- Copied Chess.com layouts, icons, sounds, board palette, or classification glyphs
-- A sweeping frontend rewrite that breaks C++ behavior
+- a ChatGPT clone;
+- a generic AI dashboard or card farm;
+- fake progress or fake intelligence;
+- excessive gradients, glass, glow, pills, or giant whitespace;
+- copied Chess.com layouts, icons, sounds, board palette, copy, or classification glyphs;
+- live-game assistance;
+- a sweeping frontend rewrite that breaks C++ behavior.
 
 ## Working method
 
-1. Inspect the real repository.
-2. Record current uncommitted work.
-3. Run the current app and tests.
-4. Capture current screenshots.
-5. Write a plan tied to actual files.
-6. Refactor incrementally.
-7. Keep one working vertical slice.
-8. Run tests and browser verification.
-9. Report files, tests, screenshots, gaps, and risks.
+1. Resolve the GitHub issue and acceptance criteria.
+2. Inspect the repository and current uncommitted work.
+3. Start from the latest remote default branch.
+4. Create a focused `codex/` feature branch.
+5. Run the relevant current tests before changing behavior.
+6. Implement one working vertical slice.
+7. Protect the C++/React boundary with typed contracts.
+8. Run tests, security checks, and real-browser verification in proportion to risk.
+9. Inspect and stage only the intended diff.
+10. Push the branch and open a draft PR for user review.
+11. Report files, contracts, tests, screenshots, risks, and the next issue.
 
 ## Git rules
 
-- Do not commit.
-- Do not push.
-- Do not delete uncommitted work.
-- Do not overwrite files before inspection.
+- Create a new branch for every coherent feature.
+- Open a PR after implementation and testing.
+- Do not merge the PR; the user acts as engineering manager.
+- Do not delete or overwrite unrelated uncommitted work.
+- Do not use broad staging in a mixed worktree.
 - Keep `archive/` ignored and local.
+- Use issues, milestones, and labels to keep the six-phase roadmap visible.

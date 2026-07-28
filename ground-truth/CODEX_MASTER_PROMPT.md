@@ -4,100 +4,112 @@ Run this from the repository root.
 
 ---
 
-You are restructuring the UX and frontend architecture of this repository. This is a C++ systems project with a React presentation layer. Do not turn it into a TypeScript chess engine, a chat app, or a generic AI dashboard.
+You are evolving Plywise into a web-first, open-source chess intelligence system. Preserve the
+working local application while building the hosted path incrementally.
 
-## Inspect first
+## Read first
 
-Read root `AGENTS.md` and `ground-truth/` in the required order.
+Read:
 
-Audit the real repository before modifying it. Identify:
+1. root `AGENTS.md`;
+2. `ground-truth/00-READ-FIRST.md`;
+3. `ground-truth/PRODUCT_VISION.md`;
+4. `ground-truth/WEB_ROADMAP.md`;
+5. `ground-truth/WEB_ARCHITECTURE.md`;
+6. `ground-truth/ENGINE_BENCHMARK_PLAN.md` for engine work;
+7. `ground-truth/SYSTEM_ARCHITECTURE.md`;
+8. the relevant feature specification;
+9. `ground-truth/DESIGN_SYSTEM.md`;
+10. `ground-truth/ENGINEERING_RULES.md`;
+11. `ground-truth/VISUAL_QA.md`.
 
-- Frontend framework, package manager, build commands
-- Routes, state management, components, chessboard implementation
-- C++ build/runtime topology
-- Frontend-to-C++ transport and API types
-- Tests and visual tooling
-- All Markdown files
-- Current uncommitted changes
+Inspect the real branch, status, code, API contracts, tests, and current app before editing.
 
-Run the app and verify the reported working Analysis flow: import Chess.com link, display game, navigate playthrough, show best move, and launch/display analysis.
+## Product contract
 
-Do not begin a broad refactor until you can explain how these behaviors work in actual files.
-
-## Migrate documentation
-
-Follow `ground-truth/REPOSITORY_MIGRATION.md`.
-
-- Add `/archive/` to `.gitignore` first.
-- Create a local ignored archive.
-- Preserve required public docs.
-- Move only obsolete/duplicate/draft/superseded Markdown.
-- Leave ambiguous files and report them.
-- Repair links.
-- Verify archive is absent from Git status.
-- Create `ground-truth/MIGRATION_REPORT.md`.
-- Never commit or push.
+- Completed single-game analysis stays free.
+- The website is the primary product.
+- Guest analysis does not require an account.
+- Accounts add saving, synchronization, and personal intelligence.
+- Payment, if ever introduced, funds real cost or differentiated value.
+- Live-game assistance is prohibited.
+- The extension remains blocked until its Chess.com integration is authorized.
 
 ## Preserve the C++ boundary
 
-C++ owns import/sync, PGN/SAN/FEN, legality, Stockfish, scheduling/progress, cache/storage, classification, opening recognition, pattern detection, variations, player modeling, and future local-model interfaces.
+C++ owns import normalization, PGN/SAN/FEN, legality, review assembly, classification, opening
+recognition, pattern detection, variations, player modeling, and server engine orchestration.
 
-React owns presentation and interaction.
+React owns layout, rendering, browser-worker lifecycle, accessibility, and user intent.
 
-When UI needs new information, extend a typed C++ contract. Never recreate chess-domain logic in React.
+Browser Stockfish output is untrusted input. It becomes a Plywise review only after typed C++
+validation and domain processing.
 
-## Product direction
+Do not create a TypeScript chess engine, generic AI dashboard, chat interface, fake progress, or
+unversioned client-side product truth.
 
-Recent Games → select game(s) → press Analyze → real backend progress → review every move → move list/eval/class/opening/accuracy → optional engine detail → retry → unlimited legal variation → return to canonical game.
+## Delivery workflow
 
-Default theme follows macOS system appearance; original navy-led identity; beginner-friendly but capable for streamers.
+1. Resolve the issue and acceptance criteria.
+2. Confirm the latest remote default branch.
+3. Create a focused `codex/` feature branch.
+4. Record existing uncommitted work.
+5. Implement one working vertical slice.
+6. Run proportional tests and real-browser QA.
+7. Inspect the complete diff.
+8. Commit and push only the intended scope.
+9. Open a draft PR for user review.
 
-Do not copy Chess.com's layout, icons, palette, sounds, classification glyphs, copy, or algorithm. Do not copy ChatGPT's conversational layout.
+Never merge the PR on the user's behalf.
 
-## Configurable behavior
+## Current sequencing
 
-Engine lines, best-move reveal, retry, variation assistance, automatic patterns, technical detail, explanation depth, analysis depth, MultiPV, CPU threads, hash memory, and coaching style.
+### Phase 0
 
-Styles: Beginner and friendly; Cynical and hard; Devil's advocate.
+Product definition, architecture, benchmarks, policy, licensing, backlog, and web migration seams.
 
-Explanations are deterministic now. Preserve a future local `ICoachingProvider` boundary.
+### Phase 1
 
-## Staged implementation
+Deployable React frontend, hosted C++ service, PostgreSQL repository boundary, authentication,
+tenant isolation, and one saved online review.
 
-### A. Audit
+### Phase 2
 
-Produce a report with file paths, commands, contracts, behavior, risks, and current screenshots.
+Free guest analysis, browser Stockfish, versioned result submission, account history, privacy
+controls, and private-alpha verification.
 
-### B. Documentation migration
-
-Complete the ignored local archive and canonical ground truth.
-
-### C. Foundation
-
-Consolidate themes, tokens, typography, focus, primitives, shell, sidebar, errors, and empty states. Reuse the existing stack unless a dependency change is justified.
-
-### D. One vertical slice
-
-Implement and verify:
-
-Recent game → Analyze → real progress from C++ → completed review → navigate → evaluation/class/opening/accuracy → reveal best move → enter variation → play legal moves → return.
-
-Do not redesign all secondary pages before this works.
-
-### E. Secondary screens
-
-Then improve Explore, Progress, and Settings using real data only.
+Later phases add personal intelligence, an authorized browser companion, sustainable optional
+features, and public hardening. Follow `WEB_ROADMAP.md`.
 
 ## Verification
 
-Run existing tests and add focused tests. Use Playwright or equivalent on the real app in both themes at 1440×900, 1280×800, and the minimum width. Exercise import, analyze, cancel, navigation, retry, variation, settings, and errors. Follow `ground-truth/VISUAL_QA.md`.
+Protect the existing local flow:
 
-## Final report
+completed-game import → explicit Analyze → real progress → completed review → navigation → best
+move → retry → legal variation → canonical return → restart persistence.
 
-Report audit, Markdown migration, files changed, architecture decisions, API changes, tests, screenshots, performance notes, gaps, risks, and exact next stage.
+For web work, additionally verify:
 
-Do not commit or push.
+- guest and account flows;
+- cross-account denial;
+- browser/server review parity;
+- idempotent import and submission;
+- cancellation and stale-job handling;
+- export and deletion;
+- both themes and supported widths;
+- keyboard and accessibility;
+- no live-game analysis path.
 
-Begin with the audit and implementation plan. Do not make sweeping code changes in the first response.
+## Reporting
+
+Every PR reports:
+
+- issue and user outcome;
+- files and contracts changed;
+- C++/React ownership decisions;
+- tests and browser evidence;
+- security and privacy impact;
+- performance or cost evidence;
+- gaps, blockers, and next issue.
 
 ---

@@ -1,46 +1,91 @@
 # Chess.com Integration
 
-## Current
+## Status
 
-Preserve the working import-by-game-link flow.
+The existing completed-game URL and public archive flow remains the reference implementation.
 
-## Future refresh
+The public website may support:
 
-Use Chess.com's public read-only PubAPI rather than scraping:
+- a user-pasted completed-game URL;
+- a user-pasted PGN;
+- permitted public profile/archive synchronization.
 
-1. Store username locally.
-2. Request archive list.
-3. Request relevant recent months.
-4. Compare stable game IDs/URLs with local records.
-5. Import unseen games.
-6. Display them in Recent Games.
-7. Analyze only after user action.
+The proposed browser extension remains blocked until Chess.com provides written clarification or
+authorization for the intended completed-game workflow.
 
-## Operational behavior
+## Rules
 
-Official Chess.com documentation says the PubAPI is read-only, public data may be cached for up to roughly 12 hours, serial access is unlimited, parallel requests can receive 429, and a descriptive User-Agent with contact information is recommended.
+- Analyze completed games only.
+- Never provide assistance for a live or ongoing game.
+- Never collect a Chess.com password, session cookie, authentication token, chat, or private data.
+- Prefer documented public APIs.
+- Do not scrape page content when an approved API or user-provided PGN is available.
+- Do not imply affiliation, sponsorship, or compatibility approval.
+- Do not describe Plywise as bypassing a paywall.
+- Do not copy Chess.com's board, pieces, sounds, icons, classification glyphs, product copy, or
+  layout.
 
-Therefore:
+## Public API behavior
 
-- Serialize or conservatively bound requests.
-- Use ETag/Last-Modified when available.
-- Back off on 429 and transient failures.
-- Identify the app in User-Agent.
-- Show data freshness.
-- Do not promise instant synchronization.
+Use the read-only PubAPI conservatively:
+
+1. Store a normalized public username after explicit user action.
+2. Request archive metadata serially or with a documented small bound.
+3. Use ETag and Last-Modified when supplied.
+4. Respect cache freshness and 429 responses.
+5. Send a descriptive User-Agent with a project contact.
+6. Import unseen completed games only.
+7. Show synchronization freshness.
+8. Analyze only after the user asks.
+
+Public API freshness does not guarantee instant post-game availability. The product must not promise
+that profile refresh alone imports a game immediately.
+
+## Browser companion proposal
+
+The minimum-permission extension concept is:
+
+1. The user invokes Plywise on a completed game page.
+2. The extension reads only the current public game URL.
+3. It confirms a completed state through an approved signal.
+4. It displays a clear user-facing action.
+5. On click, it opens Plywise with a short-lived import handoff.
+6. Plywise resolves the completed game through the approved integration path.
+
+An injected button underneath the board is a later option, not the starting implementation.
+
+Before extension work, send Chess.com:
+
+- product purpose and open-source repository;
+- exact data accessed;
+- completed-game and fair-play safeguards;
+- proposed UI location;
+- API request behavior;
+- retention and deletion behavior;
+- privacy policy and contact;
+- explicit request for written authorization.
 
 ## Data
 
-Normalize PGN, game URL, players, ratings, time control, result, end time, variant, and available opening metadata. Validate before analysis.
+Normalize and validate:
 
-## Brand/IP boundary
-
-Do not copy Chess.com board palettes, pieces, sounds, move-classification glyphs, logo, UI layout, product copy, or branded assets. Public game data does not grant rights to product design.
+- stable game identity and URL;
+- PGN;
+- players and ratings;
+- result and termination;
+- time control and end time;
+- variant;
+- available opening metadata;
+- upstream freshness and provenance.
 
 ## Errors
 
-Unknown username, no public games, stale upstream data, rate limit, offline, malformed response, unsupported variant, and duplicate import.
+Unknown username, unavailable or stale game, incomplete game, unsupported variant, duplicate import,
+rate limiting, upstream failure, malformed response, and policy-disabled extension behavior are
+distinct structured states.
 
 ## Privacy
 
-Username is local; local reviews are not sent to Chess.com; linked-profile data can be removed.
+Users can disconnect a public username, export linked records, and delete account data. Public data
+retrieval is disclosed plainly. No game is made publicly discoverable by Plywise merely because it
+was public upstream.
