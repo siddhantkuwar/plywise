@@ -129,6 +129,59 @@ class PreemptibleEngine final : public engine::AnalysisEngine {
     bool allow_historical_{false};
 };
 
+void run_priority_cleanup_iteration(std::size_t iteration) {
+    const auto directory =
+        std::filesystem::temp_directory_path() /
+        ("pct-jobs-priority-" + std::to_string(::getpid()) + "-" +
+         std::to_string(iteration));
+    const auto path = directory / "events.log";
+    std::filesystem::remove_all(directory);
+    {
+        storage::EventLog log(path);
+        app::Repository repository(log);
+        import::ImportService importer;
+        const auto older = importer.from_pgn(
+            "[Date \"2025.01.01\"]\n[White \"A\"]\n[Black \"B\"]\n"
+            "[Result \"1-0\"]\n\n1. e4 e5 1-0");
+        const auto recent = importer.from_pgn(
+            "[Date \"2026.06.20\"]\n[White \"A\"]\n[Black \"C\"]\n"
+            "[Result \"0-1\"]\n\n1. d4 d5 0-1");
+        static_cast<void>(repository.add(older));
+        static_cast<void>(repository.add(recent));
+        StagedEngine engine;
+        analysis::AnalysisCache cache;
+        analysis::Analyzer analyzer(engine, cache,
+                                    analysis::AnalyzerOptions{2, 3, 80, 2, 1});
+        repository.save_shallow_analysis(analyzer.analyze_shallow(older.game));
+        repository.set_background_paused(true);
+        app::JobManager jobs(repository, analyzer);
+        const auto started =
+            jobs.start_batch({older.game.identity, recent.game.identity});
+        CHECK_EQ(started.size(), 2ULL);
+        CHECK_EQ(started.front().game_id, recent.game.identity);
+        jobs.resume();
+        for (int attempt = 0; attempt < 200 &&
+                              !repository.get(recent.game.identity)->shallow_analysis;
+             ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(repository.get(recent.game.identity)->shallow_analysis.has_value());
+        CHECK(!repository.get(older.game.identity)->analysis.has_value());
+        engine.allow_deep = true;
+        for (int attempt = 0; attempt < 200; ++attempt) {
+            if (repository.get(older.game.identity)->analysis &&
+                repository.get(recent.game.identity)->analysis) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        CHECK(repository.get(older.game.identity)->analysis.has_value());
+        CHECK(repository.get(recent.game.identity)->analysis.has_value());
+    }
+    std::filesystem::remove_all(directory);
+    CHECK(!std::filesystem::exists(directory));
+}
+
 } // namespace
 
 TEST_CASE("job manager runs analysis in background and deduplicates active work") {
@@ -477,45 +530,8 @@ TEST_CASE("observer unsubscribe waits for callbacks and callback failures do not
 }
 
 TEST_CASE("batch scheduling prioritizes recent shallow work before resumed deep work") {
-    const auto directory = std::filesystem::temp_directory_path() /
-                           ("pct-jobs-priority-" + std::to_string(::getpid()));
-    const auto path = directory / "events.log";
-    std::filesystem::remove_all(directory);
-    storage::EventLog log(path);
-    app::Repository repository(log);
-    import::ImportService importer;
-    const auto older = importer.from_pgn(
-        "[Date \"2025.01.01\"]\n[White \"A\"]\n[Black \"B\"]\n[Result \"1-0\"]\n\n1. e4 e5 1-0");
-    const auto recent = importer.from_pgn(
-        "[Date \"2026.06.20\"]\n[White \"A\"]\n[Black \"C\"]\n[Result \"0-1\"]\n\n1. d4 d5 0-1");
-    static_cast<void>(repository.add(older));
-    static_cast<void>(repository.add(recent));
-    StagedEngine engine;
-    analysis::AnalysisCache cache;
-    analysis::Analyzer analyzer(engine, cache, analysis::AnalyzerOptions{2, 3, 80, 2, 1});
-    repository.save_shallow_analysis(analyzer.analyze_shallow(older.game));
-    repository.set_background_paused(true);
-    app::JobManager jobs(repository, analyzer);
-    const auto started = jobs.start_batch({older.game.identity, recent.game.identity});
-    CHECK_EQ(started.size(), 2ULL);
-    CHECK_EQ(started.front().game_id, recent.game.identity);
-    jobs.resume();
-    for (int attempt = 0; attempt < 200 &&
-                          !repository.get(recent.game.identity)->shallow_analysis;
-         ++attempt)
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    CHECK(repository.get(recent.game.identity)->shallow_analysis.has_value());
-    CHECK(!repository.get(older.game.identity)->analysis.has_value());
-    engine.allow_deep = true;
-    for (int attempt = 0; attempt < 200; ++attempt) {
-        if (repository.get(older.game.identity)->analysis &&
-            repository.get(recent.game.identity)->analysis)
-            break;
-        std::this_thread::sleep_for(std::chrono::milliseconds(5));
-    }
-    CHECK(repository.get(older.game.identity)->analysis.has_value());
-    CHECK(repository.get(recent.game.identity)->analysis.has_value());
-    std::filesystem::remove_all(directory);
+    for (std::size_t iteration = 0; iteration < 25; ++iteration)
+        run_priority_cleanup_iteration(iteration);
 }
 
 TEST_CASE("completed batch games are retained without being requeued") {
