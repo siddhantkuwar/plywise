@@ -11,6 +11,11 @@ fund material cost or provide genuinely distinct value.
 
 ## Phase 0 — Web product definition
 
+### Status
+
+Engineering definition is complete. The original-code license and Chess.com authorization remain
+explicit owner/external blockers; neither is misrepresented as complete.
+
 ### Deliverables
 
 - Canonical web product vision and architecture.
