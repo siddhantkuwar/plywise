@@ -15,5 +15,5 @@ xcrun xctrace record --template "Time Profiler" --output "$TRACE" \
 xcrun xctrace export --input "$TRACE" \
   --xpath '/trace-toc/run[@number="1"]/data/table[@schema="time-profile"]' \
   --output "$XML"
-node "$ROOT/scripts/xctrace-flamegraph.js" "$XML" "$ROOT/release/profiles/flamegraph.svg"
-printf '%s\n' "$ROOT/release/profiles/flamegraph.svg"
+node "$ROOT/scripts/xctrace-flamegraph.js" "$XML" "$ROOT/artifacts/profiles/flamegraph.svg"
+printf '%s\n' "$ROOT/artifacts/profiles/flamegraph.svg"

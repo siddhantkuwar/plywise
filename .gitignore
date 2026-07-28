@@ -43,6 +43,18 @@ web/dist/
 # Historical documentation retained only on this machine
 /archive/
 
-# Local visual-QA evidence
-/artifacts/ui-audit/
-/artifacts/playwright/
+# Local agent instructions, product planning, and review material
+/.agents/
+/AGENTS.md
+/ground-truth/
+/chess-analysis-frontend-north-star/
+/design/
+/release/
+/restructure-plan.html
+/security_best_practices_report.md
+/plywise-threat-model.md
+/scripts/check-release-links.js
+
+# Generated audits, benchmarks, and visual-QA evidence
+/artifacts/
+/web/public/pieces/ASSET_AUDIT.md
