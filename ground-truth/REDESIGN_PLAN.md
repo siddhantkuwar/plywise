@@ -1,5 +1,7 @@
 # Redesign Plan
 
+> Historical plan for the workstation redesign. Current work is governed by `WEB_ROADMAP.md`.
+
 ## Strategy
 
 Use an incremental vertical slice, not a glorious one-shot rewrite followed by three days locating the Analyze button.

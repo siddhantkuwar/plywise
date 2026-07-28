@@ -1,5 +1,8 @@
 # Ground-Truth Implementation Report
 
+> Historical verification evidence for the local application. It is preserved rather than rewritten
+> for the web pivot.
+
 Date: 2026-07-21
 
 ## Outcome

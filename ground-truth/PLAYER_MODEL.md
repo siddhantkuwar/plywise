@@ -1,40 +1,58 @@
-# Player Model and Progress
+# Player Model and Personal Intelligence
 
 ## Purpose
 
-Progress is a profile of the user's chess, not a pile of decorative charts.
+The personal intelligence layer is Plywise's main long-term differentiation.
+
+It is a traceable model of the user's chess—not a generic dashboard, personality score, or pile of
+decorative charts.
 
 ## Sources
 
-Chess.com public profile/rating data, imported PGNs, local reviews, classifications, openings, patterns, retry/training outcomes, and review behavior.
+- Permitted public profile and rating data.
+- Imported canonical PGNs.
+- Versioned Plywise reviews.
+- Move classifications, openings, and patterns.
+- Retry and practice outcomes.
+- Review behavior intentionally saved by the user.
 
-## Profile
+Guest reviews do not silently join an account profile. The user deliberately saves or imports them.
+
+## Profile areas
 
 ### Rating
 
-Current and historical rating by time control, peak, recent change, game count, and freshness. Never fabricate unavailable ratings.
+Current and historical rating by time control, peak, recent change, game count, and freshness.
 
 ### Move quality
 
-Accuracy, errors per game, average evaluation loss, first serious error, and performance when winning/equal/losing.
+Accuracy, errors per game, average evaluation loss, first serious error, and performance while
+winning, equal, or losing.
 
 ### Game phase
 
-Opening, middlegame, endgame, with sample size and trend.
+Opening, middlegame, and endgame evidence with sample size and trend.
 
 ### Openings
 
-Structure, color, results, evaluation after key ranges, common personal deviation, repeated errors, and relevant lessons.
+Color, results, evaluation at key ranges, personal departures, repeated errors, and supporting
+positions.
 
 ### Patterns
 
-Seen, missed, successfully used, impact, trend, practice history, and mastery.
+Seen, missed, successfully used, impact, recurrence, practice history, and later-game transfer.
+
+### Review behavior
+
+Reviews started and completed, retries attempted, hints used, variations explored, and positions
+revisited. These are learning signals, not engagement tricks.
 
 ## Weakness taxonomy
 
-Examples: hanging pieces, ignored threats, unsafe king, premature pawn pushes, bad trades while behind, missed tactics, passed-pawn handling, back-rank safety, delayed development, time pressure.
+Examples include hanging pieces, ignored threats, unsafe king, premature pawn moves, poor trades,
+missed tactics, passed-pawn handling, back-rank safety, delayed development, and time pressure.
 
-A weakness aggregates repeated evidence and links to positions.
+A weakness aggregates repeated evidence and always links to supporting positions.
 
 ## Deterministic insights
 
@@ -42,14 +60,41 @@ Examples:
 
 > In your last 20 analyzed rapid games, 11 of 17 major errors occurred before move 12.
 
-> Italian Game results improved, but delaying castling still causes repeated evaluation loss.
+> You solved three piece-safety retries, but the same pattern appeared again in two later games.
 
-Every sentence must be traceable to structured data.
+Each claim stores:
+
+- account and analysis scope;
+- supporting game and ply identifiers;
+- numerator and denominator;
+- time-control and date window;
+- detector/classifier versions;
+- confidence and freshness.
 
 ## Confidence
 
-Account for sample size, recency, time control, detector confidence, and version compatibility. Do not declare endgame mastery after two endings because the graph looked lonely.
+Confidence accounts for sample size, recency, time control, detector strength, engine compatibility,
+and version changes. Insufficient evidence is an explicit state.
 
-## Privacy
+Do not declare mastery or decline from a tiny or incompatible sample.
 
-Local by default, no telemetry upload, explicit export/deletion, and clear disclosure of public Chess.com data retrieval.
+## Practice selection
+
+Practice prioritizes:
+
+1. recurring high-impact weaknesses;
+2. recently missed motifs;
+3. positions not yet successfully retried;
+4. spaced repetition due dates;
+5. evidence of failure transferring into later games.
+
+The system explains why each position was selected.
+
+## Privacy and ownership
+
+- Account data is private by default.
+- No telemetry or model training use is implied by account creation.
+- Export and deletion are first-class product actions.
+- Cross-account aggregation uses no identifiable game content without explicit consent.
+- Connected public profile data can be disconnected and removed.
+- Retention and backup behavior are documented.

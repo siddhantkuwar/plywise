@@ -1,91 +1,144 @@
 # System Architecture
 
+## Target
+
 ```text
-React presentation
-  routes, components, board, settings, charts
-            │ typed local API / IPC / HTTP
-C++ application services
-  import, analysis orchestration, review assembly, profiles
-        ┌───┴───────────────────────────┐
-C++ chess domain                Systems infrastructure
-board, legality, PGN,           Stockfish, scheduler, cache,
-variations, patterns            storage, networking, logging
+React web application
+  guest flow, account flow, board, review, practice, settings
+        │                         │
+        │ typed HTTPS/events      └── browser Stockfish Web Worker
+        │                               free default compute
+        ▼
+C++ application service
+  import, validation, review assembly, classifications, profiles
+        │                         │
+        │                         └── optional C++/Stockfish workers
+        │                               deep or batch compute
+        ▼
+Persistence interfaces
+  PostgreSQL projections, versioned analysis records, job events, backups
 ```
 
-## Layers
+The existing loopback application remains a supported development and reference mode. The website
+becomes the primary user-facing product.
 
-### Presentation
+## Ownership
 
-React renders state and sends user intent. It does not derive chess truth.
+### React
 
-### Application
+React owns:
 
-C++ use cases such as:
+- routes, layouts, themes, and accessible interaction;
+- board rendering and user move intent;
+- guest/account onboarding;
+- progress presentation;
+- transient disclosure and selection state;
+- starting and stopping a browser engine worker.
 
-- ImportGameFromUrl
-- SyncRecentGames
-- AnalyzeGame / CancelAnalysis
+React does not decide move legality, classification, opening truth, pattern truth, or player-profile
+truth.
+
+### Browser engine worker
+
+The browser worker produces versioned Stockfish observations for free analysis:
+
+- position;
+- engine identity and build;
+- search profile and limits;
+- evaluation, nodes, time, MultiPV, and principal variations;
+- cancellation and failure state.
+
+These observations are untrusted input to the hosted service. The C++ boundary validates positions,
+legal principal variations, configuration limits, and completeness before producing a canonical
+Plywise review.
+
+### C++ application and domain
+
+C++ owns:
+
+- public completed-game import and PGN normalization;
+- SAN, FEN, board reconstruction, and legal moves;
+- canonical game identity and immutable move history;
+- review assembly, classification, opening recognition, patterns, and explanations;
+- variation validation;
+- profile, weakness, practice, and confidence aggregation;
+- server Stockfish lifecycle and scheduling;
+- version compatibility and deterministic persistence contracts.
+
+### Persistence
+
+The hosted system uses explicit repositories for games, analyses, profiles, drills, settings, and
+jobs. PostgreSQL is the initial multi-user projection store.
+
+The existing append-only event model may continue where it provides useful recovery, audit, and
+replay behavior. The application layer must no longer assume that one filesystem directory
+represents the only user.
+
+## Identity and tenancy
+
+- Guest analysis receives a short-lived anonymous session identifier.
+- Account requests carry a verified identity from the authentication provider.
+- Every durable user-owned record has an account ID.
+- Authorization is enforced in the C++ service before reading or mutating records.
+- Database row-level controls may provide defense in depth but do not replace application checks.
+- Public game data is not automatically public inside Plywise.
+
+## Main use cases
+
+- ImportCompletedGame
+- StartGuestAnalysis
+- SubmitBrowserEngineObservations
+- StartServerAnalysis
+- CancelAnalysis
 - GetReview
+- SaveGuestReviewToAccount
 - CreateVariation / ExtendVariation
 - GetPlayerProfile
-- UpdateAnalysisSettings
+- GeneratePracticeQueue
+- ExportAccountData
+- DeleteAccountData
 
-### Domain
-
-Game, Move, Position, Variation, Evaluation, Classification, Opening, Pattern, Weakness, Drill, AnalysisConfiguration.
-
-### Infrastructure
-
-Stockfish adapter, Chess.com client, storage, thread pool, cache, metrics, and the local transport layer.
-
-## Suggested interfaces
-
-```cpp
-class IChessEngine;
-class IGameImporter;
-class IGameRepository;
-class IAnalysisRepository;
-class IAnalysisScheduler;
-class IOpeningBook;
-class IPatternDetector;
-class IPlayerModelStore;
-class ICoachingProvider;
-```
-
-Adapt names to the existing code; preserve the separation.
-
-## Frontend contract
-
-React consumes structured objects and explicit enums, not parsed logs.
-
-```json
-{
-  "analysisId": "a_123",
-  "gameId": "g_456",
-  "status": "classifying",
-  "completedUnits": 51,
-  "totalUnits": 72,
-  "message": "Classifying move quality"
-}
-```
-
-## Canonical game versus variations
+## Canonical game and analyses
 
 ```text
-ImportedGame (immutable canonical move sequence)
-└── AnalysisSession
-    └── VariationTree
-        ├── Branch A
-        └── Branch B
+ImportedGame (immutable canonical moves)
+├── AnalysisRun (engine + configuration + classifier versions)
+│   └── MoveAssessments
+├── ReviewAttempts
+└── VariationTree
 ```
 
-A branch stores a root position plus legal moves. It never rewrites the PGN.
+Reanalysis creates a new versioned run or deliberately supersedes one under an explicit
+compatibility rule. It never silently changes the imported game.
+
+## Progress
+
+Progress is event driven for browser and server analysis:
+
+```text
+queued
+preparing
+reconstructing
+evaluating
+validating
+classifying
+detecting_patterns
+persisting
+completed
+cancelled
+failed
+```
+
+Completed units and totals represent real positions or stages. Timers must not imitate progress.
 
 ## Failure boundaries
 
-- Stockfish failure cannot crash the UI.
-- Import failure cannot corrupt history.
-- Cancellation ends in an explicit cancelled state.
-- Malformed PGN produces a structured error.
-- Storage distinguishes incomplete tails from valid records.
-- React renders partial and failed states deliberately.
+- Browser engine failure cannot lose the imported game.
+- Server engine failure cannot crash the web application.
+- Import failure cannot create a partial canonical record.
+- Cancellation reaches an explicit final state.
+- Malformed PGN and engine output produce structured errors.
+- A stale job cannot replace a newer run.
+- One account cannot address another account's records.
+- Database or queue retries are idempotent.
+- Guest expiration is explained before local work is discarded.

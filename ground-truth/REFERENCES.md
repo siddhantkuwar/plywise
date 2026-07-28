@@ -33,7 +33,40 @@ Applied principles:
 - Implement an independent classifier.
 - Create original icons, colors, board treatment, copy, and layout.
 - Public game data and protected product UI are separate matters.
+- The browser companion requires written clarification before implementation.
+
+## Web engine and extension
+
+- Stockfish.js: https://github.com/nmrugg/stockfish.js/
+- Stockfish license: https://stockfishchess.org/about/
+- Chrome extension policies: https://developer.chrome.com/docs/webstore/program-policies/policies
+- Chrome activeTab: https://developer.chrome.com/docs/extensions/develop/concepts/activeTab
+- Chrome side panel: https://developer.chrome.com/docs/extensions/reference/api/sidePanel
+
+Applied principles:
+
+- Run free engine work in a browser worker where supported.
+- Record engine version and configuration.
+- Treat browser observations as untrusted until C++ validation.
+- Use one narrow extension purpose and the least permissions.
+- Do not load remotely hosted extension code.
+
+## Hosting research
+
+- Cloudflare Pages: https://developers.cloudflare.com/pages/
+- Cloudflare Workers limits: https://developers.cloudflare.com/workers/platform/limits/
+- Supabase pricing and free-tier limits: https://supabase.com/pricing
+- GitHub Student Developer Pack: https://education.github.com/pack
+
+Applied principles:
+
+- Static hosting can begin free.
+- Edge request handlers are not a substitute for sustained Stockfish CPU.
+- Free service limits are prototype constraints, not a durable scaling plan.
+- Use a provider subdomain until a stable project domain is justified.
 
 ## Legal note
 
-This package is an engineering/product specification, not legal advice. Obtain qualified review before commercialization if product similarity, branding, or data use creates uncertainty.
+This package is an engineering/product specification, not legal advice. Obtain qualified review for
+license compatibility, Stockfish distribution, branding, data use, and extension behavior when
+uncertainty remains.
