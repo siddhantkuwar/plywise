@@ -48,7 +48,7 @@ std::string recency_key(const StoredGame& game) {
 
 } // namespace
 
-JobManager::JobManager(Repository& repository, analysis::Analyzer& analyzer,
+JobManager::JobManager(IRepository& repository, analysis::Analyzer& analyzer,
                        JobManagerOptions options)
     : repository_(repository), analyzer_(analyzer), options_(options),
       paused_(repository.background_paused()) {

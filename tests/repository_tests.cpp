@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <type_traits>
 #include <unistd.h>
 
 using namespace pct;
@@ -38,6 +39,50 @@ void remove_repository_files(const std::filesystem::path& path) {
 }
 
 } // namespace
+
+static_assert(std::is_base_of_v<app::IRepository, app::EventLogRepository>);
+static_assert(std::is_base_of_v<app::IGameRepository, app::EventLogRepository>);
+static_assert(std::is_base_of_v<app::IAnalysisRepository, app::EventLogRepository>);
+
+TEST_CASE("repository owner ids keep account and guest scopes explicit") {
+    const auto local = app::OwnerId::local();
+    const auto guest = app::OwnerId::guest("guest_opaque_01");
+    const auto account = app::OwnerId::account("account_opaque_01");
+
+    CHECK(local.kind() == app::OwnerKind::Local);
+    CHECK(guest.kind() == app::OwnerKind::Guest);
+    CHECK(account.kind() == app::OwnerKind::Account);
+    CHECK_EQ(local.value(), "local");
+    CHECK_EQ(guest.value(), "guest_opaque_01");
+    CHECK_EQ(account.value(), "account_opaque_01");
+    CHECK(!(guest == account));
+    CHECK_THROWS(app::OwnerId::guest(""));
+    CHECK_THROWS(app::OwnerId::account(""));
+}
+
+TEST_CASE("event log adapter serves owner-scoped repository interfaces") {
+    const auto path = repository_path();
+    remove_repository_files(path);
+    const chess::Game parsed = chess::parse_pgn(pgn);
+    const import::ImportedGame imported{
+        parsed, {}, std::string(pgn), import::ImportMethod::ManualPgn};
+
+    {
+        storage::EventLog log(path);
+        app::EventLogRepository local(log);
+        app::IGameRepository& games = local;
+        app::IAnalysisRepository& analyses = local;
+
+        CHECK(games.owner() == app::OwnerId::local());
+        CHECK(games.add(imported) == app::AddResult::Added);
+        analysis::GameAnalysis completed;
+        completed.game_id = parsed.identity;
+        completed.accuracy = 82.0;
+        analyses.save_analysis(completed);
+        CHECK(games.get(parsed.identity)->analysis.has_value());
+    }
+    remove_repository_files(path);
+}
 
 TEST_CASE("repository deduplicates imports and replays completed analysis") {
     const auto path = repository_path();

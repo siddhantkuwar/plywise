@@ -35,7 +35,7 @@ class Api {
     using Diagnostics = std::function<json::Value()>;
     using AdvancedDrills = std::function<std::vector<training::Drill>()>;
 
-    Api(import::ImportService& importer, app::Repository& repository, app::JobManager& jobs,
+    Api(import::ImportService& importer, app::IRepository& repository, app::JobManager& jobs,
         Diagnostics diagnostics = {}, AdvancedDrills advanced_drills = {},
         app::IngestManager* ingest = nullptr)
         : importer_(importer), repository_(repository), jobs_(jobs),
@@ -46,7 +46,7 @@ class Api {
 
   private:
     import::ImportService& importer_;
-    app::Repository& repository_;
+    app::IRepository& repository_;
     app::JobManager& jobs_;
     Diagnostics diagnostics_;
     AdvancedDrills advanced_drills_;

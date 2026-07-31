@@ -129,7 +129,7 @@ archive_entry(const import::ChessComArchiveGame& game, std::string_view username
                                 std::string(source_url)};
 }
 
-std::size_t persist_archive_chunks(Repository& repository,
+std::size_t persist_archive_chunks(IGameRepository& repository,
                                    const std::vector<ChessComArchiveEntry>& entries) {
     std::size_t indexed = 0;
     std::vector<ChessComArchiveEntry> chunk;
@@ -246,7 +246,7 @@ json::Value to_json(const IngestSync& value) {
         {"updated_at_ms", static_cast<double>(value.updated_at_ms)}};
 }
 
-IngestManager::IngestManager(import::ImportService& importer, Repository& repository,
+IngestManager::IngestManager(import::ImportService& importer, IRepository& repository,
                              JobManager&, import::HttpTransport transport,
                              import::RetrySleeper sleeper, IngestOptions options,
                              std::string startup_username)
