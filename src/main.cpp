@@ -9,21 +9,32 @@
 #include "pct/service/http_server.hpp"
 #include "pct/storage/event_log.hpp"
 
-#include <filesystem>
 #include <algorithm>
+#include <chrono>
+#include <csignal>
 #include <cstdlib>
+#include <filesystem>
 #include <iostream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 namespace {
+
+volatile std::sig_atomic_t stop_requested = 0;
+
+extern "C" void request_stop(int) {
+    stop_requested = 1;
+}
 
 struct Options {
     std::filesystem::path data_dir{"data"};
     std::filesystem::path web_root{"web/dist"};
     std::string stockfish{"stockfish"};
+    std::string bind_address{"127.0.0.1"};
     std::uint16_t port{8787};
     std::size_t workers{std::min<std::size_t>(2, std::max(1U, std::thread::hardware_concurrency()))};
     std::size_t max_pending{256};
@@ -31,10 +42,79 @@ struct Options {
     std::filesystem::path tactical_corpus{"resources/tactical-corpus.json"};
     bool tactical_corpus_enabled{true};
     std::string chesscom_username;
+    std::vector<std::string> trusted_hosts;
+    std::vector<std::string> allowed_origins;
 };
 
-Options parse_options(int argc, char** argv) {
+std::optional<std::string> environment(std::string_view name) {
+    if (const char* value = std::getenv(std::string(name).c_str());
+        value != nullptr && value[0] != '\0') {
+        return value;
+    }
+    return std::nullopt;
+}
+
+std::vector<std::string> comma_separated(std::string_view value) {
+    std::vector<std::string> result;
+    while (!value.empty()) {
+        const std::size_t separator = value.find(',');
+        std::string entry(value.substr(0, separator));
+        const std::size_t first = entry.find_first_not_of(" \t");
+        const std::size_t last = entry.find_last_not_of(" \t");
+        if (first != std::string::npos)
+            result.push_back(entry.substr(first, last - first + 1));
+        if (separator == std::string_view::npos)
+            break;
+        value.remove_prefix(separator + 1);
+    }
+    return result;
+}
+
+unsigned long bounded_number(std::string_view value, std::string_view name,
+                             unsigned long minimum, unsigned long maximum) {
+    std::size_t consumed = 0;
+    const unsigned long parsed = std::stoul(std::string(value), &consumed);
+    if (consumed != value.size() || parsed < minimum || parsed > maximum) {
+        throw std::runtime_error(std::string(name) + " must be between " +
+                                 std::to_string(minimum) + " and " +
+                                 std::to_string(maximum));
+    }
+    return parsed;
+}
+
+Options environment_options() {
     Options options;
+    if (const auto value = environment("PCT_DATA_DIR"))
+        options.data_dir = *value;
+    if (const auto value = environment("PCT_WEB_ROOT"))
+        options.web_root = *value;
+    if (const auto value = environment("PCT_STOCKFISH"))
+        options.stockfish = *value;
+    if (const auto value = environment("PCT_BIND_ADDRESS"))
+        options.bind_address = *value;
+    if (const auto value = environment("PCT_PORT")) {
+        options.port = static_cast<std::uint16_t>(
+            bounded_number(*value, "PCT_PORT", 1, 65535));
+    }
+    if (const auto value = environment("PCT_WORKERS"))
+        options.workers = bounded_number(*value, "PCT_WORKERS", 1, 16);
+    if (const auto value = environment("PCT_MAX_PENDING"))
+        options.max_pending = bounded_number(*value, "PCT_MAX_PENDING", 1, 10000);
+    if (const auto value = environment("PCT_RETRY_LIMIT"))
+        options.retry_limit = bounded_number(*value, "PCT_RETRY_LIMIT", 0, 10);
+    if (const auto value = environment("PCT_TACTICAL_CORPUS"))
+        options.tactical_corpus = *value;
+    if (const auto value = environment("PCT_CHESSCOM_USERNAME"))
+        options.chesscom_username = *value;
+    if (const auto value = environment("PCT_TRUSTED_HOSTS"))
+        options.trusted_hosts = comma_separated(*value);
+    if (const auto value = environment("PCT_ALLOWED_ORIGINS"))
+        options.allowed_origins = comma_separated(*value);
+    return options;
+}
+
+Options parse_options(int argc, char** argv) {
+    Options options = environment_options();
     for (int index = 1; index < argc; ++index) {
         const std::string_view argument = argv[index];
         const auto value = [&]() -> std::string {
@@ -48,43 +128,39 @@ Options parse_options(int argc, char** argv) {
             options.web_root = value();
         else if (argument == "--stockfish")
             options.stockfish = value();
+        else if (argument == "--bind-address")
+            options.bind_address = value();
         else if (argument == "--port") {
-            const unsigned long port = std::stoul(value());
-            if (port == 0 || port > 65535)
-                throw std::runtime_error("port is outside 1-65535");
+            const unsigned long port = bounded_number(value(), "port", 1, 65535);
             options.port = static_cast<std::uint16_t>(port);
         } else if (argument == "--workers") {
-            options.workers = std::stoul(value());
-            if (options.workers == 0 || options.workers > 16)
-                throw std::runtime_error("workers must be between 1 and 16");
+            options.workers = bounded_number(value(), "workers", 1, 16);
         } else if (argument == "--max-pending") {
-            options.max_pending = std::stoul(value());
-            if (options.max_pending == 0 || options.max_pending > 10000)
-                throw std::runtime_error("max-pending must be between 1 and 10000");
+            options.max_pending = bounded_number(value(), "max-pending", 1, 10000);
         } else if (argument == "--retry-limit") {
-            options.retry_limit = std::stoul(value());
-            if (options.retry_limit > 10)
-                throw std::runtime_error("retry-limit must be at most 10");
+            options.retry_limit = bounded_number(value(), "retry-limit", 0, 10);
         } else if (argument == "--tactical-corpus") {
             options.tactical_corpus = value();
         } else if (argument == "--no-tactical-corpus") {
             options.tactical_corpus_enabled = false;
         } else if (argument == "--chesscom-username") {
             options.chesscom_username = value();
+        } else if (argument == "--trusted-host") {
+            options.trusted_hosts.push_back(value());
+        } else if (argument == "--allowed-origin") {
+            options.allowed_origins.push_back(value());
         } else if (argument == "--help") {
             std::cout << "usage: personal-chess-tutor [--data-dir path] [--web-root path] "
-                         "[--stockfish path] [--port number] [--workers 1-16] "
+                         "[--stockfish path] [--bind-address IPv4] [--port number] "
+                         "[--workers 1-16] "
                          "[--max-pending count] [--retry-limit count] "
                          "[--chesscom-username public-name] "
+                         "[--trusted-host hostname] [--allowed-origin https-origin] "
                          "[--tactical-corpus path | --no-tactical-corpus]\n";
             std::exit(0);
         } else {
             throw std::runtime_error("unknown option: " + std::string(argument));
         }
-    }
-    if (options.chesscom_username.empty()) {
-        if (const char* username = std::getenv("PCT_CHESSCOM_USERNAME"))
-            options.chesscom_username = username;
     }
     return options;
 }
@@ -94,6 +170,10 @@ Options parse_options(int argc, char** argv) {
 int main(int argc, char** argv) {
     try {
         const Options options = parse_options(argc, argv);
+        stop_requested = 0;
+        std::signal(SIGINT, request_stop);
+        std::signal(SIGTERM, request_stop);
+
         std::filesystem::create_directories(options.data_dir);
         pct::storage::EventLog event_log(options.data_dir / "events.log");
         if (event_log.replay().truncated_tail) {
@@ -103,6 +183,19 @@ int main(int argc, char** argv) {
         }
         pct::app::Repository repository(event_log);
         pct::import::ImportService importer;
+        bool engine_ready = false;
+        std::string engine_identity = options.stockfish;
+        try {
+            engine_identity = pct::engine::Stockfish::resolve_executable(options.stockfish);
+            pct::engine::Stockfish probe(
+                pct::engine::StockfishOptions{engine_identity, 16, 1});
+            probe.start();
+            probe.stop();
+            engine_ready = true;
+        } catch (const std::exception& error) {
+            pct::log(pct::LogLevel::Warning, "stockfish",
+                     "engine readiness probe failed: " + std::string(error.what()));
+        }
         pct::engine::EnginePool engines(
             [&](std::size_t) {
                 return std::make_unique<pct::engine::Stockfish>(
@@ -149,14 +242,33 @@ int main(int argc, char** argv) {
             if (!advanced_drills)
                 return std::vector<pct::training::Drill>{};
             return advanced_drills->generate(repository.profile(), repository.drills(0), 5);
-        }, &ingest);
+        }, &ingest, [=] {
+            return pct::service::Readiness{
+                true, engine_ready, options.bind_address == "127.0.0.1", engine_identity};
+        });
         pct::service::HttpServer server(
-            api, jobs, pct::service::ServerOptions{options.port, options.web_root}, &ingest);
+            api, jobs,
+            pct::service::ServerOptions{options.port, options.web_root, options.bind_address,
+                                        options.trusted_hosts, options.allowed_origins},
+            &ingest);
         if (!std::filesystem::exists(options.web_root / "index.html")) {
-            pct::log(pct::LogLevel::Warning, "http",
-                     "frontend build is missing; run npm run build --prefix web");
+            const bool local_only = options.bind_address == "127.0.0.1";
+            pct::log(local_only ? pct::LogLevel::Warning : pct::LogLevel::Info, "http",
+                     local_only
+                         ? "frontend build is missing; run npm run build --prefix web"
+                         : "frontend build is not mounted; serving the API only");
         }
+        std::jthread signal_watcher([&](std::stop_token token) {
+            while (!token.stop_requested() && stop_requested == 0)
+                std::this_thread::sleep_for(std::chrono::milliseconds(25));
+            if (stop_requested != 0) {
+                pct::log(pct::LogLevel::Info, "runtime",
+                         "shutdown requested; stopping HTTP admission");
+                server.stop();
+            }
+        });
         server.run();
+        signal_watcher.request_stop();
         return 0;
     } catch (const std::exception& error) {
         std::cerr << "fatal: " << error.what() << '\n';

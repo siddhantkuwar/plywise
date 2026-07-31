@@ -197,9 +197,12 @@ TEST_CASE("cached URL import accepts current Chess.com generic Site PGN") {
     CHECK(fixture.jobs.list().empty());
 }
 
-TEST_CASE("HTTP and WebSocket lifecycle reject non-loopback browser authorities") {
+TEST_CASE("HTTP and WebSocket lifecycle enforce configured browser authorities") {
     ChessComApiFixture fixture;
-    service::HttpServer server(fixture.api, fixture.jobs, service::ServerOptions{0, {}},
+    service::HttpServer server(
+        fixture.api, fixture.jobs,
+        service::ServerOptions{0, {}, "127.0.0.1", {"api.plywise.test"},
+                               {"https://app.plywise.test"}},
                                &fixture.ingest);
     std::exception_ptr server_error;
     std::thread server_thread([&] {
@@ -247,6 +250,18 @@ TEST_CASE("HTTP and WebSocket lifecycle reject non-loopback browser authorities"
         close(accepted_http);
     }
 
+    const int accepted_preflight = port == 0 ? -1 : connect_loopback(port);
+    std::string accepted_preflight_response;
+    if (accepted_preflight >= 0) {
+        const std::string request =
+            "OPTIONS /api/games HTTP/1.1\r\nHost: api.plywise.test\r\n"
+            "Origin: https://app.plywise.test\r\n"
+            "Access-Control-Request-Method: GET\r\nConnection: close\r\n\r\n";
+        static_cast<void>(send(accepted_preflight, request.data(), request.size(), 0));
+        accepted_preflight_response = receive_available(accepted_preflight);
+        close(accepted_preflight);
+    }
+
     const int rejected = port == 0 ? -1 : connect_loopback(port);
     std::string rejected_response;
     if (rejected >= 0) {
@@ -284,6 +299,10 @@ TEST_CASE("HTTP and WebSocket lifecycle reject non-loopback browser authorities"
     CHECK(rejected_http_host_response.starts_with("HTTP/1.1 403 Forbidden"));
     CHECK(accepted_http >= 0);
     CHECK(accepted_http_response.starts_with("HTTP/1.1 200 OK"));
+    CHECK(accepted_preflight >= 0);
+    CHECK(accepted_preflight_response.starts_with("HTTP/1.1 204 No Content"));
+    CHECK(accepted_preflight_response.find(
+              "Access-Control-Allow-Origin: https://app.plywise.test") != std::string::npos);
     CHECK(rejected >= 0);
     CHECK(rejected_response.starts_with("HTTP/1.1 403 Forbidden"));
     CHECK(accepted >= 0);
@@ -292,4 +311,14 @@ TEST_CASE("HTTP and WebSocket lifecycle reject non-loopback browser authorities"
     CHECK(!server_error);
     CHECK(service::HttpServer::valid_websocket_origin("http://localhost:8787"));
     CHECK(!service::HttpServer::valid_websocket_origin("http://localhost.evil:8787"));
+}
+
+TEST_CASE("hosted authority configuration rejects wildcards and public plaintext origins") {
+    ChessComApiFixture fixture;
+    CHECK_THROWS(service::HttpServer(
+        fixture.api, fixture.jobs,
+        service::ServerOptions{0, {}, "127.0.0.1", {"*.plywise.test"}, {}}));
+    CHECK_THROWS(service::HttpServer(
+        fixture.api, fixture.jobs,
+        service::ServerOptions{0, {}, "127.0.0.1", {}, {"http://app.plywise.test"}}));
 }

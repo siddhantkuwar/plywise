@@ -69,7 +69,10 @@ template <typename T> T read_little_endian(const std::byte* data) {
     using Unsigned = std::make_unsigned_t<T>;
     Unsigned value = 0;
     for (std::size_t index = 0; index < sizeof(T); ++index) {
-        value |= static_cast<Unsigned>(std::to_integer<unsigned>(data[index])) << (index * 8U);
+        const Unsigned byte =
+            static_cast<Unsigned>(std::to_integer<unsigned>(data[index]));
+        value = static_cast<Unsigned>(
+            value | static_cast<Unsigned>(byte << (index * 8U)));
     }
     return static_cast<T>(value);
 }

@@ -182,6 +182,25 @@ TEST_CASE("API validates request shape and unknown resources") {
     CHECK_EQ(fixture.api.handle(service::Request{"GET", "/api/unknown", {}, {}}).status, 404);
 }
 
+TEST_CASE("API distinguishes liveness from engine readiness") {
+    ApiFixture fixture;
+    service::Api degraded(fixture.importer, fixture.repository, fixture.jobs, {}, {}, nullptr, [] {
+        return service::Readiness{true, false, false, "/missing/stockfish"};
+    });
+    const auto health = degraded.handle(service::Request{"GET", "/api/health", {}, {}});
+    CHECK_EQ(health.status, 200);
+    CHECK_EQ(json::parse(health.body).at("status").as_string(), "ok");
+    CHECK(!json::parse(health.body).at("local_only").as_bool());
+
+    const auto ready = degraded.handle(service::Request{"GET", "/api/ready", {}, {}});
+    CHECK_EQ(ready.status, 503);
+    const auto body = json::parse(ready.body);
+    CHECK_EQ(body.at("status").as_string(), "not_ready");
+    CHECK_EQ(body.at("components").at("api").as_string(), "ready");
+    CHECK_EQ(body.at("components").at("storage").as_string(), "ready");
+    CHECK_EQ(body.at("components").at("engine").as_string(), "unavailable");
+}
+
 TEST_CASE("API path router decodes identifiers safely") {
     ApiFixture fixture;
     const auto response = fixture.api.handle(

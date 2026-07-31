@@ -400,9 +400,9 @@ void JobManager::work(CancellationToken stop_token) {
                         AnalysisJob snapshot;
                         {
                             std::lock_guard lock(mutex_);
-                            auto& job = jobs_.at(id);
-                            job.progress = progress;
-                            snapshot = job;
+                            auto& active_job = jobs_.at(id);
+                            active_job.progress = progress;
+                            snapshot = active_job;
                         }
                         notify(snapshot);
                     },

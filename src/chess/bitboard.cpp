@@ -77,7 +77,7 @@ std::uint64_t BitboardBoard::occupancy(Color color) const {
 
 int BitboardBoard::material(Color color) const {
     int result = 0;
-    for (const auto [type, value] : {
+    for (const auto& [type, value] : {
              std::pair{PieceType::Pawn, 100}, std::pair{PieceType::Knight, 320},
              std::pair{PieceType::Bishop, 330}, std::pair{PieceType::Rook, 500},
              std::pair{PieceType::Queen, 900}}) {

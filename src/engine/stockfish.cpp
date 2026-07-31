@@ -250,8 +250,9 @@ std::string Stockfish::read_line(std::chrono::steady_clock::time_point deadline,
         const auto remaining =
             std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
         pollfd descriptor{output_fd_, POLLIN, 0};
-        const int result =
-            poll(&descriptor, 1, static_cast<int>(std::min(remaining.count(), 50LL)));
+        const int result = poll(
+            &descriptor, 1,
+            static_cast<int>(std::min<std::chrono::milliseconds::rep>(remaining.count(), 50)));
         if (result < 0) {
             if (errno == EINTR)
                 continue;
