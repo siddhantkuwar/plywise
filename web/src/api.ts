@@ -17,6 +17,7 @@ import type {
   Variation,
   VariationAnalysis,
 } from "./types";
+import { apiUrl } from "./config/runtime";
 
 export class ApiError extends Error {
   readonly status: number;
@@ -33,13 +34,18 @@ export class ApiError extends Error {
 }
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
-  const response = await fetch(path, {
+  const headers = new Headers(init?.headers);
+  if (init?.body != null && !headers.has("Content-Type")) {
+    headers.set("Content-Type", "application/json");
+  }
+  const response = await fetch(apiUrl(path), {
     ...init,
-    headers: { "Content-Type": "application/json", ...init?.headers },
+    headers,
+    redirect: "error",
   });
   const contentType = response.headers.get("content-type") ?? "";
   if (!contentType.includes("application/json")) {
-    throw new Error("Local API service is not running.");
+    throw new Error("Plywise API is unavailable.");
   }
   const body = (await response.json()) as T & Partial<ApiFailure>;
   if (!response.ok) {
