@@ -30,17 +30,25 @@ struct Response {
     std::string body;
 };
 
+struct Readiness {
+    bool storage_ready{true};
+    bool engine_ready{true};
+    bool local_only{true};
+    std::string engine;
+};
+
 class Api {
   public:
     using Diagnostics = std::function<json::Value()>;
     using AdvancedDrills = std::function<std::vector<training::Drill>()>;
+    using ReadinessCheck = std::function<Readiness()>;
 
     Api(import::ImportService& importer, app::Repository& repository, app::JobManager& jobs,
         Diagnostics diagnostics = {}, AdvancedDrills advanced_drills = {},
-        app::IngestManager* ingest = nullptr)
+        app::IngestManager* ingest = nullptr, ReadinessCheck readiness = {})
         : importer_(importer), repository_(repository), jobs_(jobs),
           diagnostics_(std::move(diagnostics)), advanced_drills_(std::move(advanced_drills)),
-          ingest_(ingest) {}
+          ingest_(ingest), readiness_(std::move(readiness)) {}
 
     [[nodiscard]] Response handle(const Request& request);
 
@@ -51,11 +59,15 @@ class Api {
     Diagnostics diagnostics_;
     AdvancedDrills advanced_drills_;
     app::IngestManager* ingest_{nullptr};
+    ReadinessCheck readiness_;
 };
 
 struct ServerOptions {
     std::uint16_t port{8787};
     std::filesystem::path web_root{"web/dist"};
+    std::string bind_address{"127.0.0.1"};
+    std::vector<std::string> trusted_hosts;
+    std::vector<std::string> allowed_origins;
 };
 
 class HttpServer {
@@ -91,6 +103,8 @@ class HttpServer {
     void handle_client(int client_fd);
     void handle_websocket(int client_fd, const Request& request);
     [[nodiscard]] Response static_file(std::string_view path) const;
+    [[nodiscard]] bool host_allowed(std::string_view host) const;
+    [[nodiscard]] bool origin_allowed(std::string_view origin) const;
 };
 
 } // namespace pct::service

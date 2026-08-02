@@ -150,7 +150,7 @@ std::string tactical_motif(chess::Board before, const chess::Move& best) {
     }
     if (valuable_attacks >= 2)
         return "Fork";
-    for (const auto [file_step, rank_step] :
+    for (const auto& [file_step, rank_step] :
          {std::pair{-1, -1}, {-1, 0}, {-1, 1}, {0, -1}, {0, 1}, {1, -1}, {1, 0}, {1, 1}}) {
         std::vector<chess::Piece> line;
         int file = static_cast<int>(best.to % 8) + file_step;

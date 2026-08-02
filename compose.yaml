@@ -1,0 +1,27 @@
+services:
+  api:
+    build:
+      context: .
+    image: plywise-api:local
+    init: true
+    read_only: true
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 768m
+    cpus: 1.5
+    stop_grace_period: 20s
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    volumes:
+      - plywise-data:/var/lib/plywise
+    ports:
+      - "127.0.0.1:8787:8787"
+    environment:
+      PCT_TRUSTED_HOSTS: ${PCT_TRUSTED_HOSTS:-}
+      PCT_ALLOWED_ORIGINS: ${PCT_ALLOWED_ORIGINS:-}
+
+volumes:
+  plywise-data:

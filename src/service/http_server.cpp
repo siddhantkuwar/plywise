@@ -91,6 +91,43 @@ bool valid_loopback_origin(std::string_view origin) {
            valid_loopback_authority(origin.substr(scheme.size()));
 }
 
+bool valid_port(std::string_view value) {
+    if (value.empty() || value.size() > 5)
+        return false;
+    unsigned port = 0;
+    const auto parsed = std::from_chars(value.data(), value.data() + value.size(), port);
+    return parsed.ec == std::errc{} && parsed.ptr == value.data() + value.size() &&
+           port > 0 && port <= 65535;
+}
+
+bool matches_authority(std::string_view authority, std::string_view allowed) {
+    if (authority == allowed)
+        return true;
+    if (allowed.find(':') != std::string_view::npos || !authority.starts_with(allowed) ||
+        authority.size() <= allowed.size() || authority[allowed.size()] != ':')
+        return false;
+    return valid_port(authority.substr(allowed.size() + 1));
+}
+
+bool valid_trusted_host(std::string_view host) {
+    if (host.empty() || host.find_first_of("/\\?#@* \t\r\n") != std::string_view::npos)
+        return false;
+    const std::size_t colon = host.find(':');
+    return colon == std::string_view::npos ||
+           (host.find(':', colon + 1) == std::string_view::npos &&
+            colon > 0 && valid_port(host.substr(colon + 1)));
+}
+
+bool valid_configured_origin(std::string_view origin) {
+    if (valid_loopback_origin(origin))
+        return true;
+    constexpr std::string_view scheme = "https://";
+    if (!origin.starts_with(scheme))
+        return false;
+    const std::string_view authority = origin.substr(scheme.size());
+    return valid_trusted_host(authority) && authority.find('/') == std::string_view::npos;
+}
+
 std::string percent_decode(std::string_view value) {
     std::string result;
     result.reserve(value.size());
@@ -260,8 +297,12 @@ std::string reason_phrase(int status) {
     switch (status) {
     case 200:
         return "OK";
+    case 201:
+        return "Created";
     case 202:
         return "Accepted";
+    case 204:
+        return "No Content";
     case 400:
         return "Bad Request";
     case 403:
@@ -278,6 +319,8 @@ std::string reason_phrase(int status) {
         return "Internal Server Error";
     case 502:
         return "Bad Gateway";
+    case 503:
+        return "Service Unavailable";
     case 504:
         return "Gateway Timeout";
     default:
@@ -476,12 +519,30 @@ Response Api::handle(const Request& request) {
     try {
         const auto parts = path_parts(request.path);
         if (request.method == "GET" && parts == std::vector<std::string>{"api", "health"}) {
+            const Readiness state = readiness_ ? readiness_() : Readiness{};
             return json_response(200, json::Value::Object{
                                           {"status", "ok"},
                                           {"version", "0.3.0"},
-                                          {"local_only", true},
+                                          {"service", "plywise-api"},
+                                          {"local_only", state.local_only},
                                           {"games", repository_.size()},
                                       });
+        }
+        if (request.method == "GET" && parts == std::vector<std::string>{"api", "ready"}) {
+            const Readiness state = readiness_ ? readiness_() : Readiness{};
+            const bool ready = state.storage_ready && state.engine_ready;
+            return json_response(
+                ready ? 200 : 503,
+                json::Value::Object{
+                    {"status", ready ? "ready" : "not_ready"},
+                    {"components",
+                     json::Value::Object{
+                         {"api", "ready"},
+                         {"storage", state.storage_ready ? "ready" : "unavailable"},
+                         {"engine", state.engine_ready ? "ready" : "unavailable"},
+                     }},
+                    {"engine", state.engine},
+                });
         }
         if (request.method == "GET" &&
             parts == std::vector<std::string>{"api", "diagnostics"}) {
@@ -993,6 +1054,19 @@ Response Api::handle(const Request& request) {
 HttpServer::HttpServer(Api& api, app::JobManager& jobs, ServerOptions options,
                        app::IngestManager* ingest)
     : api_(api), jobs_(jobs), ingest_(ingest), options_(std::move(options)) {
+    in_addr parsed_address{};
+    if (inet_pton(AF_INET, options_.bind_address.c_str(), &parsed_address) != 1) {
+        throw Error(ErrorCode::InvalidArgument,
+                    "bind address must be a valid IPv4 address");
+    }
+    for (const auto& host : options_.trusted_hosts) {
+        if (!valid_trusted_host(host))
+            throw Error(ErrorCode::InvalidArgument, "invalid trusted host: " + host);
+    }
+    for (const auto& origin : options_.allowed_origins) {
+        if (!valid_configured_origin(origin))
+            throw Error(ErrorCode::InvalidArgument, "invalid allowed origin: " + origin);
+    }
     jobs_.set_observer([this](const app::AnalysisJob& job) {
         broadcast(
             json::dump(json::Value::Object{{"type", "job_update"}, {"job", app::to_json(job)}}));
@@ -1041,12 +1115,16 @@ void HttpServer::run() {
     sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_port = htons(options_.port);
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (inet_pton(AF_INET, options_.bind_address.c_str(), &address.sin_addr) != 1) {
+        close_listener();
+        throw Error(ErrorCode::InvalidArgument, "invalid HTTP bind address");
+    }
     if (bind(listen_fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
         const std::string message = std::strerror(errno);
         close_listener();
         throw Error(ErrorCode::IoError,
-                    "failed to bind 127.0.0.1:" + std::to_string(options_.port) + ": " + message);
+                    "failed to bind " + options_.bind_address + ":" +
+                        std::to_string(options_.port) + ": " + message);
     }
     sockaddr_in bound_address{};
     socklen_t bound_size = sizeof(bound_address);
@@ -1060,7 +1138,7 @@ void HttpServer::run() {
     }
     const std::uint16_t actual_port = ntohs(bound_address.sin_port);
     bound_port_.store(actual_port, std::memory_order_release);
-    log(LogLevel::Info, "http", "listening on http://127.0.0.1:" +
+    log(LogLevel::Info, "http", "listening on http://" + options_.bind_address + ":" +
                                  std::to_string(actual_port));
     while (!stopped_.load(std::memory_order_acquire)) {
         const int client = accept(listen_fd, nullptr, nullptr);
@@ -1099,8 +1177,8 @@ void HttpServer::handle_client(int client_fd) {
         }
         const auto host = request->headers.find("host");
         const auto origin = request->headers.find("origin");
-        if ((host != request->headers.end() && !valid_loopback_authority(host->second)) ||
-            (origin != request->headers.end() && !valid_loopback_origin(origin->second))) {
+        if (host == request->headers.end() || !host_allowed(host->second) ||
+            (origin != request->headers.end() && !origin_allowed(origin->second))) {
             constexpr std::string_view forbidden =
                 "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
             static_cast<void>(send_all(client_fd, forbidden.data(), forbidden.size()));
@@ -1113,8 +1191,23 @@ void HttpServer::handle_client(int client_fd) {
             handle_websocket(client_fd, *request);
             return;
         }
-        Response response =
-            request->path.starts_with("/api/") ? api_.handle(*request) : static_file(request->path);
+        Response response;
+        if (request->method == "OPTIONS" && request->path.starts_with("/api/")) {
+            response = Response{204, {}, {}};
+            response.headers.insert_or_assign("Access-Control-Allow-Methods",
+                                              "GET, POST, DELETE, OPTIONS");
+            response.headers.insert_or_assign(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, Idempotency-Key");
+            response.headers.insert_or_assign("Access-Control-Max-Age", "600");
+        } else {
+            response = request->path.starts_with("/api/") ? api_.handle(*request)
+                                                          : static_file(request->path);
+        }
+        if (origin != request->headers.end()) {
+            response.headers.insert_or_assign("Access-Control-Allow-Origin", origin->second);
+            response.headers.insert_or_assign("Vary", "Origin");
+        }
         response.headers.insert_or_assign("Content-Length", std::to_string(response.body.size()));
         response.headers.insert_or_assign("Connection", "close");
         response.headers.insert_or_assign("X-Content-Type-Options", "nosniff");
@@ -1147,7 +1240,7 @@ void HttpServer::handle_client(int client_fd) {
 
 void HttpServer::handle_websocket(int client_fd, const Request& request) {
     const auto origin = request.headers.find("origin");
-    if (origin == request.headers.end() || !valid_websocket_origin(origin->second)) {
+    if (origin == request.headers.end() || !origin_allowed(origin->second)) {
         constexpr std::string_view forbidden =
             "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
         static_cast<void>(send_all(client_fd, forbidden.data(), forbidden.size()));
@@ -1226,6 +1319,22 @@ void HttpServer::broadcast(std::string_view message) {
 
 bool HttpServer::valid_websocket_origin(std::string_view origin) {
     return valid_loopback_origin(origin);
+}
+
+bool HttpServer::host_allowed(std::string_view host) const {
+    if (valid_loopback_authority(host))
+        return true;
+    return std::any_of(options_.trusted_hosts.begin(), options_.trusted_hosts.end(),
+                       [&](const std::string& allowed) {
+                           return matches_authority(host, allowed);
+                       });
+}
+
+bool HttpServer::origin_allowed(std::string_view origin) const {
+    if (valid_loopback_origin(origin))
+        return true;
+    return std::find(options_.allowed_origins.begin(), options_.allowed_origins.end(), origin) !=
+           options_.allowed_origins.end();
 }
 
 Response HttpServer::static_file(std::string_view request_path) const {
