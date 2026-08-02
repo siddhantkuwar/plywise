@@ -672,12 +672,31 @@ bool valid_chesscom_month_checkpoint(const ChessComMonthCheckpoint& checkpoint) 
     }
 }
 
-Repository::Repository(storage::EventLog& log) : log_(log) {
+OwnerId::OwnerId(OwnerKind kind, std::string id) : kind_(kind), value_(std::move(id)) {
+    if (value_.empty())
+        throw Error(ErrorCode::InvalidArgument, "Repository owner id cannot be empty");
+    if (value_.size() > 256)
+        throw Error(ErrorCode::InvalidArgument, "Repository owner id is too long");
+}
+
+OwnerId OwnerId::local() {
+    return OwnerId(OwnerKind::Local, "local");
+}
+
+OwnerId OwnerId::guest(std::string id) {
+    return OwnerId(OwnerKind::Guest, std::move(id));
+}
+
+OwnerId OwnerId::account(std::string id) {
+    return OwnerId(OwnerKind::Account, std::move(id));
+}
+
+EventLogRepository::EventLogRepository(storage::EventLog& log) : log_(log) {
     replay();
     rebuild_indexes();
 }
 
-void Repository::replay() {
+void EventLogRepository::replay() {
     const storage::ReplayResult events = log_.replay();
     std::uint64_t snapshot_event_id = 0;
     std::uint64_t selected_snapshot_marker_id = 0;
@@ -953,7 +972,7 @@ void Repository::replay() {
     projection_contiguous_ = events.corruptions.empty() && !events.truncated_tail;
 }
 
-void Repository::note_applied_event(const storage::Event& event) {
+void EventLogRepository::note_applied_event(const storage::Event& event) {
     if (projection_contiguous_ && event.id == projection_event_id_ + 1) {
         projection_event_id_ = event.id;
         return;
@@ -961,12 +980,12 @@ void Repository::note_applied_event(const storage::Event& event) {
     projection_contiguous_ = false;
 }
 
-AddResult Repository::add(const import::ImportedGame& imported) {
+AddResult EventLogRepository::add(const import::ImportedGame& imported) {
     std::lock_guard lock(mutex_);
     return add_unlocked(imported, true);
 }
 
-BulkAddResult Repository::bulk_add(std::vector<import::ImportedGame> imported_games) {
+BulkAddResult EventLogRepository::bulk_add(std::vector<import::ImportedGame> imported_games) {
     if (imported_games.size() > bulk_game_import_limit)
         throw Error(ErrorCode::InvalidArgument, "bulk game import has too many games");
     std::size_t total_pgn_bytes = 0;
@@ -1002,7 +1021,7 @@ BulkAddResult Repository::bulk_add(std::vector<import::ImportedGame> imported_ga
     return result;
 }
 
-AddResult Repository::add_unlocked(const import::ImportedGame& imported,
+AddResult EventLogRepository::add_unlocked(const import::ImportedGame& imported,
                                    bool rebuild_indexes_after_add) {
     if (games_.contains(imported.game.identity))
         return AddResult::Duplicate;
@@ -1039,7 +1058,7 @@ AddResult Repository::add_unlocked(const import::ImportedGame& imported,
     return AddResult::Added;
 }
 
-void Repository::save_analysis(const analysis::GameAnalysis& analysis) {
+void EventLogRepository::save_analysis(const analysis::GameAnalysis& analysis) {
     std::unique_lock lock(mutex_);
     const auto found = games_.find(analysis.game_id);
     if (found == games_.end())
@@ -1172,7 +1191,7 @@ void Repository::save_analysis(const analysis::GameAnalysis& analysis) {
         static_cast<void>(create_snapshot());
 }
 
-void Repository::save_shallow_analysis(const analysis::GameAnalysis& analysis) {
+void EventLogRepository::save_shallow_analysis(const analysis::GameAnalysis& analysis) {
     std::lock_guard lock(mutex_);
     const auto found = games_.find(analysis.game_id);
     if (found == games_.end())
@@ -1189,7 +1208,7 @@ void Repository::save_shallow_analysis(const analysis::GameAnalysis& analysis) {
     rebuild_indexes();
 }
 
-std::optional<StoredGame> Repository::get(std::string_view id) const {
+std::optional<StoredGame> EventLogRepository::get(std::string_view id) const {
     std::lock_guard lock(mutex_);
     const auto found = games_.find(std::string(id));
     if (found == games_.end())
@@ -1197,7 +1216,7 @@ std::optional<StoredGame> Repository::get(std::string_view id) const {
     return found->second;
 }
 
-bool Repository::add_validated_drill(training::Drill drill) {
+bool EventLogRepository::add_validated_drill(training::Drill drill) {
     std::lock_guard lock(mutex_);
     if (drill.id.empty() || drill.fen.empty() || drill.solutions.empty() ||
         drill.validation_evidence.empty())
@@ -1222,7 +1241,7 @@ bool Repository::add_validated_drill(training::Drill drill) {
     return true;
 }
 
-std::vector<StoredGame> Repository::list() const {
+std::vector<StoredGame> EventLogRepository::list() const {
     std::lock_guard lock(mutex_);
     std::vector<StoredGame> result;
     result.reserve(games_.size());
@@ -1231,12 +1250,12 @@ std::vector<StoredGame> Repository::list() const {
     return result;
 }
 
-std::size_t Repository::size() const {
+std::size_t EventLogRepository::size() const {
     std::lock_guard lock(mutex_);
     return games_.size();
 }
 
-std::vector<training::Drill> Repository::drills(std::int64_t now_ms) const {
+std::vector<training::Drill> EventLogRepository::drills(std::int64_t now_ms) const {
     std::lock_guard lock(mutex_);
     std::vector<training::Drill> result;
     for (const auto& [_, drill] : drills_)
@@ -1244,13 +1263,13 @@ std::vector<training::Drill> Repository::drills(std::int64_t now_ms) const {
     return training::review_queue(std::move(result), now_ms);
 }
 
-std::optional<training::Drill> Repository::drill(std::string_view id) const {
+std::optional<training::Drill> EventLogRepository::drill(std::string_view id) const {
     std::lock_guard lock(mutex_);
     const auto found = drills_.find(std::string(id));
     return found == drills_.end() ? std::nullopt : std::optional<training::Drill>(found->second);
 }
 
-training::DrillAttempt Repository::record_attempt(std::string_view drill_id, std::string move,
+training::DrillAttempt EventLogRepository::record_attempt(std::string_view drill_id, std::string move,
                                                   std::uint64_t response_time_ms, int hint_level,
                                                   std::int64_t attempted_at_ms) {
     std::lock_guard lock(mutex_);
@@ -1310,7 +1329,7 @@ training::DrillAttempt Repository::record_attempt(std::string_view drill_id, std
     return attempt;
 }
 
-training::Drill Repository::begin_drill_session(std::string_view drill_id,
+training::Drill EventLogRepository::begin_drill_session(std::string_view drill_id,
                                                 std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
     const auto found = drills_.find(std::string(drill_id));
@@ -1330,7 +1349,7 @@ training::Drill Repository::begin_drill_session(std::string_view drill_id,
     return found->second;
 }
 
-training::Drill Repository::advance_hint(std::string_view drill_id, std::int64_t now_ms) {
+training::Drill EventLogRepository::advance_hint(std::string_view drill_id, std::int64_t now_ms) {
     std::lock_guard lock(mutex_);
     const auto found = drills_.find(std::string(drill_id));
     if (found == drills_.end())
@@ -1353,7 +1372,7 @@ training::Drill Repository::advance_hint(std::string_view drill_id, std::int64_t
     return found->second;
 }
 
-training::Profile Repository::profile_unlocked() const {
+training::Profile EventLogRepository::profile_unlocked() const {
     training::Profile result;
     result.games_imported = games_.size();
     std::map<std::string, std::size_t> player_frequency;
@@ -1581,12 +1600,12 @@ training::Profile Repository::profile_unlocked() const {
     return result;
 }
 
-training::Profile Repository::profile() const {
+training::Profile EventLogRepository::profile() const {
     std::lock_guard lock(mutex_);
     return profile_unlocked();
 }
 
-std::vector<training::Recommendation> Repository::recommendations() {
+std::vector<training::Recommendation> EventLogRepository::recommendations() {
     std::lock_guard lock(mutex_);
     auto recommendations =
         training::recommend(profile_unlocked(), training::default_catalog(), resource_completions_);
@@ -1610,7 +1629,7 @@ std::vector<training::Recommendation> Repository::recommendations() {
     return recommendations;
 }
 
-void Repository::complete_resource(std::string resource_id, std::int64_t completed_at_ms) {
+void EventLogRepository::complete_resource(std::string resource_id, std::int64_t completed_at_ms) {
     std::lock_guard lock(mutex_);
     const auto catalog = training::default_catalog();
     const bool known = std::any_of(catalog.begin(), catalog.end(), [&](const auto& resource) {
@@ -1630,7 +1649,7 @@ void Repository::complete_resource(std::string resource_id, std::int64_t complet
     rebuild_indexes();
 }
 
-std::filesystem::path Repository::create_snapshot() {
+std::filesystem::path EventLogRepository::create_snapshot() {
     std::lock_guard lock(mutex_);
     const auto replayed = log_.replay();
     if (!replayed.corruptions.empty() || replayed.truncated_tail)
@@ -1702,7 +1721,7 @@ std::filesystem::path Repository::create_snapshot() {
     return path;
 }
 
-std::size_t Repository::compact_storage() {
+std::size_t EventLogRepository::compact_storage() {
     std::lock_guard lock(mutex_);
     const std::size_t events = log_.compact();
     const auto replayed = log_.replay();
@@ -1713,7 +1732,7 @@ std::size_t Repository::compact_storage() {
     return events;
 }
 
-void Repository::record_job_state(std::string game_id, std::string status) {
+void EventLogRepository::record_job_state(std::string game_id, std::string status) {
     std::lock_guard lock(mutex_);
     const storage::Event job_event = log_.append(
         storage::EventType::AnalysisJobStateChanged,
@@ -1722,7 +1741,7 @@ void Repository::record_job_state(std::string game_id, std::string status) {
     note_applied_event(job_event);
 }
 
-std::vector<std::string> Repository::recoverable_analysis_jobs() const {
+std::vector<std::string> EventLogRepository::recoverable_analysis_jobs() const {
     std::lock_guard lock(mutex_);
     std::vector<std::string> result;
     for (const auto& [game_id, status] : analysis_job_states_) {
@@ -1734,7 +1753,7 @@ std::vector<std::string> Repository::recoverable_analysis_jobs() const {
     return result;
 }
 
-void Repository::set_background_paused(bool paused) {
+void EventLogRepository::set_background_paused(bool paused) {
     std::lock_guard lock(mutex_);
     const storage::Event paused_event = log_.append(
         storage::EventType::BatchStateChanged,
@@ -1743,12 +1762,12 @@ void Repository::set_background_paused(bool paused) {
     note_applied_event(paused_event);
 }
 
-bool Repository::background_paused() const {
+bool EventLogRepository::background_paused() const {
     std::lock_guard lock(mutex_);
     return background_paused_;
 }
 
-json::Value Repository::create_batch(std::vector<std::string> game_ids, std::size_t discovered,
+json::Value EventLogRepository::create_batch(std::vector<std::string> game_ids, std::size_t discovered,
                                      std::size_t imported, std::size_t duplicates,
                                      std::size_t failed) {
     std::lock_guard lock(mutex_);
@@ -1769,7 +1788,7 @@ json::Value Repository::create_batch(std::vector<std::string> game_ids, std::siz
     return value;
 }
 
-json::Value Repository::batches() const {
+json::Value EventLogRepository::batches() const {
     std::lock_guard lock(mutex_);
     json::Value::Array result;
     for (const auto& [_, stored] : batches_) {
@@ -1811,7 +1830,7 @@ json::Value Repository::batches() const {
                                {"paused", background_paused_}};
 }
 
-void Repository::save_chesscom_profile(ChessComProfile profile) {
+void EventLogRepository::save_chesscom_profile(ChessComProfile profile) {
     std::lock_guard lock(mutex_);
     profile.original_username = trim_ascii(profile.original_username);
     profile.normalized_username = normalize_chesscom_username(profile.original_username);
@@ -1846,13 +1865,13 @@ void Repository::save_chesscom_profile(ChessComProfile profile) {
     rebuild_indexes();
 }
 
-std::optional<ChessComProfile> Repository::chesscom_profile() const {
+std::optional<ChessComProfile> EventLogRepository::chesscom_profile() const {
     std::lock_guard lock(mutex_);
     return chesscom_profile_;
 }
 
 std::size_t
-Repository::index_chesscom_archive_chunk(std::vector<ChessComArchiveEntry> entries) {
+EventLogRepository::index_chesscom_archive_chunk(std::vector<ChessComArchiveEntry> entries) {
     std::lock_guard lock(mutex_);
     if (entries.size() > chesscom_archive_chunk_limit)
         throw Error(ErrorCode::InvalidArgument, "Chess.com archive chunk has too many entries");
@@ -1892,7 +1911,7 @@ Repository::index_chesscom_archive_chunk(std::vector<ChessComArchiveEntry> entri
 }
 
 std::optional<ChessComArchiveEntry>
-Repository::chesscom_archive_entry(std::string_view game_id) const {
+EventLogRepository::chesscom_archive_entry(std::string_view game_id) const {
     std::lock_guard lock(mutex_);
     const auto found = chesscom_archive_.find(std::string(game_id));
     return found == chesscom_archive_.end() ? std::nullopt
@@ -1900,7 +1919,7 @@ Repository::chesscom_archive_entry(std::string_view game_id) const {
 }
 
 ChessComArchivePage
-Repository::search_chesscom_archive(const ChessComArchiveSearch& search) const {
+EventLogRepository::search_chesscom_archive(const ChessComArchiveSearch& search) const {
     std::lock_guard lock(mutex_);
     const std::string username =
         search.username.empty() ? std::string{} : normalize_chesscom_username(search.username);
@@ -1949,7 +1968,7 @@ Repository::search_chesscom_archive(const ChessComArchiveSearch& search) const {
     return page;
 }
 
-void Repository::checkpoint_chesscom_month(ChessComMonthCheckpoint checkpoint) {
+void EventLogRepository::checkpoint_chesscom_month(ChessComMonthCheckpoint checkpoint) {
     std::lock_guard lock(mutex_);
     checkpoint.username = normalize_chesscom_username(checkpoint.username);
     if (!valid_chesscom_month_checkpoint(checkpoint))
@@ -1971,7 +1990,7 @@ void Repository::checkpoint_chesscom_month(ChessComMonthCheckpoint checkpoint) {
 }
 
 std::optional<ChessComMonthCheckpoint>
-Repository::chesscom_month_checkpoint(std::string_view username, std::string_view month) const {
+EventLogRepository::chesscom_month_checkpoint(std::string_view username, std::string_view month) const {
     std::lock_guard lock(mutex_);
     if (!valid_chesscom_month(month))
         throw Error(ErrorCode::InvalidArgument, "Chess.com archive month is invalid");
@@ -1983,7 +2002,7 @@ Repository::chesscom_month_checkpoint(std::string_view username, std::string_vie
 }
 
 std::vector<ChessComMonthCheckpoint>
-Repository::chesscom_month_checkpoints(std::string_view username) const {
+EventLogRepository::chesscom_month_checkpoints(std::string_view username) const {
     std::lock_guard lock(mutex_);
     const std::string normalized =
         username.empty() ? std::string{} : normalize_chesscom_username(username);
@@ -1999,7 +2018,7 @@ Repository::chesscom_month_checkpoints(std::string_view username) const {
     return result;
 }
 
-void Repository::save_chesscom_sync_state(ChessComSyncState state) {
+void EventLogRepository::save_chesscom_sync_state(ChessComSyncState state) {
     std::lock_guard lock(mutex_);
     static const std::set<std::string> statuses{
         "idle", "running", "paused", "succeeded", "failed"};
@@ -2022,12 +2041,12 @@ void Repository::save_chesscom_sync_state(ChessComSyncState state) {
     rebuild_indexes();
 }
 
-ChessComSyncState Repository::chesscom_sync_state() const {
+ChessComSyncState EventLogRepository::chesscom_sync_state() const {
     std::lock_guard lock(mutex_);
     return chesscom_sync_state_;
 }
 
-Variation Repository::create_variation(std::string_view game_id, std::size_t root_ply,
+Variation EventLogRepository::create_variation(std::string_view game_id, std::size_t root_ply,
                                        std::string root_position) {
     std::lock_guard lock(mutex_);
     const auto game = games_.find(std::string(game_id));
@@ -2055,7 +2074,7 @@ Variation Repository::create_variation(std::string_view game_id, std::size_t roo
     return variation;
 }
 
-Variation Repository::extend_variation(std::string_view variation_id, std::uint64_t node_id,
+Variation EventLogRepository::extend_variation(std::string_view variation_id, std::uint64_t node_id,
                                        std::string_view move_uci) {
     std::lock_guard lock(mutex_);
     const auto found = variations_.find(std::string(variation_id));
@@ -2101,7 +2120,7 @@ Variation Repository::extend_variation(std::string_view variation_id, std::uint6
     return updated;
 }
 
-Variation Repository::set_variation_cursor(std::string_view variation_id,
+Variation EventLogRepository::set_variation_cursor(std::string_view variation_id,
                                            std::uint64_t node_id) {
     std::lock_guard lock(mutex_);
     const auto found = variations_.find(std::string(variation_id));
@@ -2121,17 +2140,17 @@ Variation Repository::set_variation_cursor(std::string_view variation_id,
     return updated;
 }
 
-Variation Repository::reset_variation(std::string_view variation_id) {
+Variation EventLogRepository::reset_variation(std::string_view variation_id) {
     return set_variation_cursor(variation_id, 0);
 }
 
-std::optional<Variation> Repository::variation(std::string_view variation_id) const {
+std::optional<Variation> EventLogRepository::variation(std::string_view variation_id) const {
     std::lock_guard lock(mutex_);
     const auto found = variations_.find(std::string(variation_id));
     return found == variations_.end() ? std::nullopt : std::optional<Variation>{found->second};
 }
 
-std::vector<Variation> Repository::variations(std::string_view game_id) const {
+std::vector<Variation> EventLogRepository::variations(std::string_view game_id) const {
     std::lock_guard lock(mutex_);
     std::vector<Variation> result;
     for (const auto& [_, variation] : variations_)
@@ -2140,7 +2159,7 @@ std::vector<Variation> Repository::variations(std::string_view game_id) const {
     return result;
 }
 
-bool Repository::delete_variation(std::string_view variation_id) {
+bool EventLogRepository::delete_variation(std::string_view variation_id) {
     std::lock_guard lock(mutex_);
     const auto found = variations_.find(std::string(variation_id));
     if (found == variations_.end())
@@ -2154,7 +2173,7 @@ bool Repository::delete_variation(std::string_view variation_id) {
     return true;
 }
 
-ReviewAttempt Repository::record_review_attempt(std::string_view game_id, std::size_t ply,
+ReviewAttempt EventLogRepository::record_review_attempt(std::string_view game_id, std::size_t ply,
                                                  std::string_view uci) {
     std::lock_guard lock(mutex_);
     const auto game = games_.find(std::string(game_id));
@@ -2189,7 +2208,7 @@ ReviewAttempt Repository::record_review_attempt(std::string_view game_id, std::s
     return attempt;
 }
 
-std::vector<ReviewAttempt> Repository::review_attempts(std::string_view game_id) const {
+std::vector<ReviewAttempt> EventLogRepository::review_attempts(std::string_view game_id) const {
     std::lock_guard lock(mutex_);
     std::vector<ReviewAttempt> result;
     for (const auto& attempt : review_attempts_)
@@ -2198,7 +2217,7 @@ std::vector<ReviewAttempt> Repository::review_attempts(std::string_view game_id)
     return result;
 }
 
-void Repository::rebuild_indexes() const {
+void EventLogRepository::rebuild_indexes() const {
     json::Value::Array games;
     json::Value::Array positions;
     json::Value::Array mistakes;

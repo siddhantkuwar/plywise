@@ -69,7 +69,7 @@ using IngestObserver = std::function<void(const json::Value&)>;
 
 class IngestManager {
   public:
-    IngestManager(import::ImportService& importer, Repository& repository, JobManager& jobs,
+    IngestManager(import::ImportService& importer, IRepository& repository, JobManager& jobs,
                   import::HttpTransport transport = {}, import::RetrySleeper sleeper = {},
                   IngestOptions options = {}, std::string startup_username = {});
     ~IngestManager();
@@ -101,7 +101,7 @@ class IngestManager {
     };
 
     import::ImportService& importer_;
-    Repository& repository_;
+    IRepository& repository_;
     import::ChessComArchiveClient client_;
     IngestOptions options_;
     mutable std::mutex mutex_;

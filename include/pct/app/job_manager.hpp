@@ -38,7 +38,7 @@ using JobObserver = std::function<void(const AnalysisJob&)>;
 
 class JobManager {
   public:
-    JobManager(Repository& repository, analysis::Analyzer& analyzer,
+    JobManager(IRepository& repository, analysis::Analyzer& analyzer,
                JobManagerOptions options = {});
     ~JobManager();
 
@@ -68,7 +68,7 @@ class JobManager {
     void set_observer(JobObserver observer);
 
   private:
-    Repository& repository_;
+    IRepository& repository_;
     analysis::Analyzer& analyzer_;
     JobManagerOptions options_;
     mutable std::mutex mutex_;
